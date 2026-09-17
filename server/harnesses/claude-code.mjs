@@ -204,8 +204,9 @@ function mcpServerOf(toolName) {
 }
 
 /**
- * Whether a transcript ends with the turn handed back to you, and which MCP server (if any)
- * the last tool call was reaching into.
+ * Whether a transcript ends with the turn handed back to you, which MCP server (if any) the
+ * last tool call was reaching into, and every tool call the last turn made that has not come
+ * back yet.
  *
  * A live process is not the same thing as work in progress. The CLI holds its process open while
  * it sits at the prompt, so "the pid exists and the file moved recently" marks a thread that
@@ -218,6 +219,12 @@ function mcpServerOf(toolName) {
  * the message *called* is the half worth testing. The same tool_use entries name an MCP server
  * whenever a name matches `mcp__<server>__<tool>`, which is all the colony's MCP pipes need.
  *
+ * Every call the message made is still open: this is the *last* assistant message in the file,
+ * so nothing has had a chance to answer any of them yet — a `tool_result` would be its own later
+ * record, and there is none, or the loop below would have stopped at the `user` turn carrying it
+ * first. That is what lets `tasks` list a Dagster trigger sitting next to a subagent spawn sitting
+ * next to an MCP call, all still in flight from one turn that asked for several things at once.
+ *
  * Only threads that could plausibly be running pay for this, so it costs one small read each.
  */
 async function inspectTail(file) {
@@ -225,22 +232,29 @@ async function inspectTail(file) {
   try {
     records = jsonLines(await readTail(file, TAIL_BYTES))
   } catch {
-    return { waiting: false, mcpServer: '' }
+    return { waiting: false, mcpServer: '', tasks: [] }
   }
   for (let i = records.length - 1; i >= 0; i--) {
     const r = records[i]
     // A user turn, a tool result or an attachment all mean the model speaks next — whatever the
     // process is doing, it is not waiting on anyone.
-    if (r.type === 'user') return { waiting: false, mcpServer: '' }
+    if (r.type === 'user') return { waiting: false, mcpServer: '', tasks: [] }
     if (r.type !== 'assistant') continue
     const content = r.message?.content
     const calls = Array.isArray(content) ? content.filter((c) => c?.type === 'tool_use') : []
     const waiting = !calls.length && r.message?.stop_reason !== 'tool_use'
-    // Last call wins when a turn asked for several tools at once — it is the one still in flight.
-    const mcpServer = waiting ? '' : mcpServerOf(calls[calls.length - 1]?.name)
-    return { waiting, mcpServer }
+    if (waiting) return { waiting, mcpServer: '', tasks: [] }
+    // Every call shares the one timestamp on the message that made them — the transcript has
+    // no finer a grain than that, and a turn's calls all start together anyway.
+    const startedAt = Date.parse(r.timestamp || '') || 0
+    const tasks = calls
+      .filter((c) => typeof c?.id === 'string' && c.id)
+      .map((c) => ({ id: c.id, tool: c.name || '', mcpServer: mcpServerOf(c.name), startedAt }))
+    // Last call wins when a turn asked for several tools at once — it is the one still in flight
+    // that the colony's MCP pipes light up for.
+    return { waiting, mcpServer: mcpServerOf(calls[calls.length - 1]?.name), tasks }
   }
-  return { waiting: false, mcpServer: '' }
+  return { waiting: false, mcpServer: '', tasks: [] }
 }
 
 /** Transcript metadata is expensive to parse, so keep it until the file changes. */
@@ -493,6 +507,9 @@ async function scanThreads() {
     // from the last thing it did, after it has handed the turn back, would light a pipe to
     // nowhere.
     thread.activeMcp = thread.running ? tail?.mcpServer || '' : ''
+    // Same guard as activeMcp: a task list left over from the turn before the reply came back
+    // would show the astronaut still juggling calls it already got results for.
+    thread.activeTasks = thread.running ? tail?.tasks || [] : []
     // A thread that handed the turn back wants you, whether or not the desktop app has ever seen
     // it — the only way a terminal-only thread can ask for anything at all.
     if (waiting) thread.unread = true
