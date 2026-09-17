@@ -62,6 +62,14 @@ const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer
 
 let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {} }
 let threads = []
+/**
+ * Thread ids seen alive (running or a live process) as of the last poll — kept only to catch
+ * the *moment* a thread comes back, not whether it happens to be alive right now. Archiving a
+ * thread you still have open is the common case, not an edge case: the CLI stays running long
+ * after you have told the colony you are done with a session, so "is it alive" would undo the
+ * archive on the very next poll. "Did it just become alive" only fires for an actual restart.
+ */
+let liveIds = new Set()
 /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
 let legendProjects = []
 /** The zone layout as last written to the colony file, so an unchanged map is not re-saved. */
@@ -733,10 +741,17 @@ function applyThreads(list) {
   // than leaving it stuck in the ship. `t.running` alone misses a restart that is just
   // sitting at the prompt: the CLI process is back but hasn't been handed a turn yet, so it
   // is not `running` until it has something to do. `t.hasLiveProcess` is the process itself,
-  // independent of whether it is mid-turn — see the note on it in claude-code.mjs. `t.archived`
-  // covers the ids `reconcileArchived` matched through `ref` rather than the canonical id
-  // (see server/api.mjs), so a thread archived under an old id still comes back.
-  const revived = list.filter((t) => (t.running || t.hasLiveProcess) && (archivedSet.has(t.id) || t.archived))
+  // independent of whether it is mid-turn — see the note on it in claude-code.mjs.
+  //
+  // The trigger is the *edge*, not the level: only a thread that was not alive on the last
+  // poll and is alive on this one counts. Checking "is it alive right now" instead undoes the
+  // archive on the very next poll for the ordinary case of archiving a session you still have
+  // open — its process never stopped, so it would look "revived" the instant you archived it.
+  const nowLive = new Set(list.filter((t) => t.running || t.hasLiveProcess).map((t) => t.id))
+  // `t.archived` covers the ids `reconcileArchived` matched through `ref` rather than the
+  // canonical id (see server/api.mjs), so a thread archived under an old id still comes back.
+  const revived = list.filter((t) => nowLive.has(t.id) && !liveIds.has(t.id) && (archivedSet.has(t.id) || t.archived))
+  liveIds = nowLive
   if (revived.length) {
     const goneIds = new Set(revived.map((t) => t.id))
     state.archived = state.archived.filter((id) => !goneIds.has(id))
