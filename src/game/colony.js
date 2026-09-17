@@ -30,6 +30,7 @@ import { UsageCanister } from '../world/usageCanister.js'
 import { UsageBurstField } from '../world/usageBursts.js'
 import { Astronauts } from '../agents/astronauts.js'
 import { Indicators, BADGE } from '../agents/indicators.js'
+import { TaskChips } from '../agents/taskChips.js'
 import { MAX_AGENT_CAP } from '../core/settings.js'
 import { Particles } from '../agents/particles.js'
 import { Navigation } from '../agents/navigation.js'
@@ -171,13 +172,14 @@ export class Colony {
     // later silently starves the badges — the one `?` that wants you being the thing that goes
     // missing. A badge is a single quad; the spare instances cost almost nothing.
     this.indicators = new Indicators(scene, settings, MAX_AGENT_CAP)
+    this.taskChips = new TaskChips(scene)
     this.particles = new Particles(scene, settings)
     this.scaffolds = new Scaffolds(scene, 320)
     // Birds, butterflies, fish and the cargo drones: the life that carries no information.
     this.fauna = new Fauna(scene, settings)
     this.reflections = new SceneryReflections({
       scene, renderer, settings, sky: this.sky, astronauts: this.astronauts,
-      excluded: () => [this.labelGroup, this.indicators.mesh, this.particles.points,
+      excluded: () => [this.labelGroup, this.indicators.mesh, this.taskChips.mesh, this.particles.points,
         this.fauna.group, this.grass?.mesh],
     })
     /** Set by whoever owns the speakers: (name, x, y, z) for a sound the world just made. */
@@ -1010,6 +1012,7 @@ export class Colony {
     this.astronauts.update(dt, elapsed)
     this.astronauts.updateRings(elapsed)
     this.indicators.update(this.astronauts.agents, elapsed, (a) => this._badgeFor(a))
+    this.taskChips.update(dt, elapsed, this.astronauts.agents)
     this._emit(dt, elapsed)
     this._emitMotes(dt, night)
     this.particles.ambient(dt, this.camera, this.planet, night, (x, z) => this.surfaceAt(x, z))
@@ -1267,6 +1270,7 @@ export class Colony {
     this.usageBursts.dispose()
     this.astronauts.dispose()
     this.indicators.dispose()
+    this.taskChips.dispose()
     this.particles.dispose()
     this.scaffolds.dispose()
     disposeTree(this.worldGroup)
