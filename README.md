@@ -181,7 +181,9 @@ into the same repo. Picking somebody is also picking the zone they are standing 
 - **New conversation** (`C`) starts a fresh thread in that folder. It is the same
   `claude://code/new?folder=…` deep link Finder's "New Claude Code Session Here" quick
   action uses, so the desktop app opens an empty session with the repo as its workspace —
-  nothing is resumed and nothing is written.
+  nothing is resumed and nothing is written. The chevron beside it picks which harness
+  starts the thread instead of the repo's most-used one; harnesses not installed here
+  show greyed out with why.
 - **Finder** (Explorer on Windows) opens the folder, **Copy path** copies it.
 - Underneath, everything running in that repo, whoever wants something first. Clicking one
   flies to its astronaut and selects it.

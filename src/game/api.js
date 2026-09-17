@@ -86,9 +86,23 @@ export async function saveState(state) {
  * thread again, and the browser only ever passes it straight back. Nothing in the UI knows
  * what a Claude Code session id, or a Codex rollout id, actually looks like.
  */
-export const openThread = (thread) => post('/api/open', { harness: thread.harness, ref: thread.ref })
+export const openThread = async (thread) => {
+  const res = await post('/api/open', { harness: thread.harness, ref: thread.ref })
+  if (res?.url) console.log('[bot-crossing] opening', res.url)
+  return res
+}
+
+/** Every known harness and whether it is installed here — feeds the picker. */
+export const fetchHarnesses = async () => {
+  const body = await req('/api/harnesses')
+  return body?.harnesses ?? []
+}
 
 /** A brand new thread in a repo, via that harness's own new-session deep link. */
-export const newSession = (folder, harness) => post('/api/new-session', { folder, harness })
+export const newSession = async (folder, harness) => {
+  const res = await post('/api/new-session', { folder, harness })
+  if (res?.url) console.log('[bot-crossing] opening', res.url)
+  return res
+}
 
 export const revealFolder = (folder) => post('/api/reveal', { folder })

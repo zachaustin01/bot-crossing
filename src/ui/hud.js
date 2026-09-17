@@ -39,6 +39,7 @@ const ICON = {
   archive: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18v3H3z"/><path d="M5 9v10h14V9"/><path d="M10 13h4"/></svg>`,
   close: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`,
   back: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 5.5 8 12l6.5 6.5"/></svg>`,
+  chev: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>`,
   plus: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 11.7a8 8 0 0 1-8.5 8 9.3 9.3 0 0 1-2.7-.4L4.5 21l1.4-4.1a7.9 7.9 0 0 1-2.4-5.7A8 8 0 0 1 12 3.6a8 8 0 0 1 8.5 8.1z"/><path d="M12 8.6v5.4M9.3 11.3h5.4"/></svg>`,
   folder: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.4A1.4 1.4 0 0 1 4.4 6h4.2l2 2.5h7A1.4 1.4 0 0 1 19 9.9v7.7a1.4 1.4 0 0 1-1.4 1.4H4.4A1.4 1.4 0 0 1 3 17.6z"/></svg>`,
   copy: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>`,
@@ -364,6 +365,13 @@ export class Hud {
     on('#btn-archive', 'click', () => this.actions.archiveThread?.())
     on('#btn-deselect', 'click', () => this.actions.select?.(null))
     on('#btn-new-session', 'click', () => this.actions.newConversation?.())
+    on('#btn-new-session-pick', 'click', (e) => {
+      e.stopPropagation()
+      this.toggleHarnessMenu()
+    })
+    document.addEventListener('click', (e) => {
+      if (!this.$('.harness-menu').hidden && !e.target.closest('.project-actions')) this.closeHarnessMenu()
+    })
     on('#btn-reveal', 'click', () => this.actions.revealProject?.())
     on('#btn-copy-path', 'click', () => this.actions.copyProjectPath?.())
     on('#btn-hide-project', 'click', () => this.actions.hideProject?.())
@@ -522,6 +530,7 @@ export class Hud {
     path.title = project.path || ''
     // Nothing to open a new thread in, and nothing to reveal, without a folder on disk.
     this.$('#btn-new-session').disabled = !project.path
+    this.$('#btn-new-session-pick').disabled = !project.path
     this.$('#btn-reveal').disabled = !project.path
     this.$('#btn-copy-path').disabled = !project.path
 
@@ -749,6 +758,51 @@ export class Hud {
 
   // ── visibility ──────────────────────────────────────────────────────────────────────
 
+  /**
+   * The chevron menu: one row per known harness, built on open so it never goes
+   * stale. The zone is captured here rather than read on click — polls keep
+   * arriving while the menu is open, and the selection may have moved on.
+   */
+  async toggleHarnessMenu(force) {
+    const menu = this.$('.harness-menu')
+    const open = force ?? menu.hidden
+    if (!open) return this.closeHarnessMenu()
+    const choices = await this.actions.harnessChoices?.()
+    if (!choices?.length) return false // the action already said why
+    const zone = this.project?.name
+    menu.innerHTML = ''
+    for (const c of choices) {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = 'harness-row'
+      b.disabled = !c.detected
+      b.title = c.detected ? `Start a new ${c.name} thread here` : c.reason || c.name
+      b.innerHTML =
+        `<span class="t">${escapeHtml(c.name)}</span>` +
+        (c.detected ? '' : `<span class="why">${escapeHtml(c.reason || '')}</span>`)
+      if (c.detected) {
+        b.addEventListener('click', () => {
+          this.closeHarnessMenu()
+          this.actions.newConversation?.(c.id, zone)
+        })
+      }
+      menu.appendChild(b)
+    }
+    menu.hidden = false
+    return true
+  }
+
+  /**
+   * Closes the picker; true when there was one open. The page's `Escape` key
+   * asks here first, so an open menu never reads as "leave this zone".
+   */
+  closeHarnessMenu() {
+    const menu = this.$('.harness-menu')
+    if (!menu || menu.hidden) return false
+    menu.hidden = true
+    return true
+  }
+
   /** Reflect orbit mode on the rail button. */
   setOrbit(on) {
     this.$('#btn-orbit').setAttribute('aria-pressed', String(Boolean(on)))
@@ -937,7 +991,11 @@ const TEMPLATE = `
         <button class="btn icon ghost" id="btn-locate" title="Fly to this zone">${ICON.locate}</button>
       </div>
       <div class="project-actions">
-        <button class="btn primary" id="btn-new-session" title="Start a new thread in this folder (C)">${ICON.plus} New conversation</button>
+        <div class="split">
+          <button class="btn primary" id="btn-new-session" title="Start a new thread in this folder (C)">${ICON.plus} New conversation</button>
+          <button class="btn primary icon" id="btn-new-session-pick" title="Choose which harness starts the thread">${ICON.chev}</button>
+        </div>
+        <div class="harness-menu" hidden></div>
         <div class="pair">
           <button class="btn" id="btn-reveal" title="Show this folder in ${FILE_MANAGER}">${ICON.folder} ${FILE_MANAGER}</button>
           <button class="btn" id="btn-copy-path" title="Copy the folder path">${ICON.copy} Copy path</button>

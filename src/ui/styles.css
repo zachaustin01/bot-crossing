@@ -1001,10 +1001,73 @@ body {
   gap: 6px;
   padding: 0 15px 13px;
   flex: none;
+  position: relative;
 }
 
 .side .project-actions .btn {
   height: 36px;
+}
+
+/* The New-conversation split: one face for the default harness, a chevron for the rest. */
+.side .project-actions .split {
+  display: flex;
+}
+
+.side .project-actions .split #btn-new-session {
+  flex: 1;
+  min-width: 0;
+  border-radius: 10px 0 0 10px;
+}
+
+.side .project-actions .split #btn-new-session-pick {
+  border-radius: 0 10px 10px 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.28);
+  padding: 0 9px;
+}
+
+.side .harness-menu {
+  position: absolute;
+  left: 15px;
+  right: 15px;
+  top: 48px;
+  z-index: 30;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 4px;
+}
+
+.side .harness-menu .harness-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.side .harness-menu .harness-row:hover {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.side .harness-menu .harness-row:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.side .harness-menu .harness-row .why {
+  font-size: 11px;
+  color: var(--dim);
+  white-space: nowrap;
 }
 
 .side .pair {
