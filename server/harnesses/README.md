@@ -137,6 +137,20 @@ Verified on a real machine:
 - **Codex CLI** — transcripts in `~/.codex/sessions/YYYY/MM/DD/rollout-<iso>-<uuid>.jsonl`,
   with records shaped `{ timestamp, type, payload }`, and what looks like an index at
   `~/.codex/session_index.jsonl`. Not implemented yet.
+- **OpenCode** — sessions in `~/.local/share/opencode/opencode.db` (`opencode-dev.db`
+  for the dev build; both are read and tagged per build), table `session`
+  (`id`, `directory`, `title`, `model` as JSON, `time_*` in epoch ms, `parent_id`
+  set on task children), transcript parts in `part` (`session_id`, `data`).
+  Turn state is derived from the transcript tail: only a tool call frozen
+  past its tool-aware grace period reads as waiting/unread — a fresh call,
+  even still `pending`, is the model mid-thought, because parts are born
+  pending while arguments stream in. Everything is freshness-gated, so
+  crashed sidecars' fossil `running` parts stay buried.
+  Implemented in `opencode.mjs`. Opening a thread uses the per-session link
+  `opencode://open-session?server=sidecar&session=<id>`; a new conversation
+  uses `opencode://new-session?directory=<abs-path>`. Caveat: every installed
+  build claims the `opencode://` scheme and the OS routes it to exactly one of
+  them, so a session id only resolves in the build that wrote it.
 
 For anything else, the fastest way in is usually to start a throwaway session in that harness
 and watch which files change:
