@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js'
+import { curveUniforms } from '../core/curve.js'
 
 /**
  * The usage canister: a fixed glass tube of glowing goo, off to one side of the ship, standing
@@ -30,12 +31,17 @@ const COLOR_HIGH = new THREE.Color(0x3dffb0) // full — cool, neon, healthy
 const ALARM_LEVEL = 0.15
 
 const GOO_VERTEX = `
+#include <common>
 varying float vY;
 varying vec2 vXZ;
 void main() {
   vY = position.y;
   vXZ = position.xz;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  // The hull bends with the world curve via three's own project_vertex chunk; this is a
+  // hand-rolled shader, so it has to call bcBend itself or the goo stays flat while the
+  // glass it sits in dips away underneath it.
+  vec3 bent = bcBend( ( modelMatrix * vec4( position, 1.0 ) ).xyz );
+  gl_Position = projectionMatrix * viewMatrix * vec4( bent, 1.0 );
 }
 `
 
@@ -182,6 +188,7 @@ export class UsageCanister {
         uHeight: { value: gooHeight },
         uColor: { value: COLOR_HIGH.clone() },
         uPulse: { value: 0 },
+        ...curveUniforms,
       },
       vertexShader: GOO_VERTEX,
       fragmentShader: GOO_FRAGMENT,
