@@ -8,8 +8,8 @@ import { HEAD_CLEAR } from './indicators.js'
 
 /**
  * Task chips: one small badge per background call an astronaut is currently waiting on — a
- * Dagster job it triggered, a subagent it spawned, an MCP call in flight — fanned out level
- * with the status badge above its head rather than stacked into that single badge.
+ * Dagster job it triggered, a subagent it spawned, an MCP call in flight — stacked directly
+ * above the status badge rather than folded into that single badge.
  *
  * A status badge answers "what is this thread doing"; a task chip answers "what is it *also*
  * waiting on right now", and there can be several at once. So unlike `Indicators`, which
@@ -29,15 +29,21 @@ const COLS = 1
 const ROWS = 1
 const ICON_PATHS = [mdiCog]
 
+/** A chip's own `aSize` — its full height once the quad's own ±0.5 geometry is applied. */
+const CHIP_SIZE = 0.09
+/** The status badge's normal (non-urgent) `aSize` — see `sizes[n] = ... : 0.126` in indicators.js. */
+const BADGE_SIZE = 0.126
 /**
- * How far to the side the nearest chip sits, and how much each further one adds — in the same
- * distance-scaled units as `aSize`, so these have to stay close to a chip's own size (0.09) or
- * the fan reads as floating apart from the astronaut instead of beside it. Badges only ever
- * offset by half their own size (see the Y-lift in indicators.js); chips go a little further
- * since they have to clear the badge and each other, but not much further.
+ * How far above the badge the nearest chip sits, and how much each further one adds.
+ *
+ * Both the badge and a chip anchor their own *bottom* edge at their `aCenter` (see the
+ * half-height lift below and the matching one in indicators.js), so this offset is measured
+ * from bottom-edge to bottom-edge, not centre to centre: shifting a chip's anchor up by the
+ * badge's full height puts the chip's bottom edge exactly on the badge's top edge, and each
+ * further chip only needs its own full height added on top of that to keep stacking flush.
  */
-const SIDE_BASE = 0.16
-const SIDE_STEP = 0.09
+const STACK_BASE = BADGE_SIZE
+const STACK_STEP = CHIP_SIZE
 
 export class TaskChips {
   constructor(scene, capacity = CAPACITY) {
@@ -174,8 +180,8 @@ export class TaskChips {
       centers[n * 3] = chip.x
       centers[n * 3 + 1] = chip.y + HEAD_CLEAR
       centers[n * 3 + 2] = chip.z
-      offsets[n * 2] = SIDE_BASE + chip.slot * SIDE_STEP
-      offsets[n * 2 + 1] = 0
+      offsets[n * 2] = 0
+      offsets[n * 2 + 1] = STACK_BASE + chip.slot * STACK_STEP
       sizes[n] = 0.09 + Math.sin(elapsed * 3.6 + chip.slot) * 0.006
       fades[n] = Math.max(0, chip.hold)
       this._color.setHSL(chip.hue / 360, 0.6, 0.6)
