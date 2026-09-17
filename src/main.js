@@ -627,8 +627,8 @@ window.addEventListener('keydown', (e) => {
     case 'N':
       actions.focusStatus('waiting', { scope: e.shiftKey ? 'all' : 'project' })
       break
-    case 'b':
-    case 'B':
+    case 'j':
+    case 'J':
       actions.focusStatus('agents')
       break
     case 'p':

@@ -1215,7 +1215,7 @@ const TEMPLATE = `
       <div>
         <div class="k"><span>Next needing you (project)</span><kbd>N</kbd></div>
         <div class="k"><span>Next needing you (anywhere)</span><kbd>⇧N</kbd></div>
-        <div class="k"><span>Next agent</span><kbd>M</kbd></div>
+        <div class="k"><span>Busiest agent</span><kbd>J</kbd></div>
         <div class="k"><span>Next agent (project)</span><kbd>B</kbd></div>
         <div class="k"><span>Next project</span><kbd>⇧B</kbd></div>
         <div class="k"><span>Open thread</span><kbd>Enter</kbd></div>
