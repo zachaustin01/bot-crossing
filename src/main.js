@@ -576,8 +576,8 @@ window.addEventListener('keydown', (e) => {
     case 'N':
       actions.focusStatus('waiting')
       break
-    case 'm':
-    case 'M':
+    case 'b':
+    case 'B':
       actions.focusStatus('agents')
       break
     case 'p':
