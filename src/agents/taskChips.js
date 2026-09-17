@@ -4,11 +4,12 @@ import { OVERLAY_LAYER } from '../core/engine.js'
 import { withCurve } from '../core/curve.js'
 import { hashString } from '../world/plots.js'
 import { buildIconAtlas } from './iconAtlas.js'
+import { HEAD_CLEAR } from './indicators.js'
 
 /**
  * Task chips: one small badge per background call an astronaut is currently waiting on — a
- * Dagster job it triggered, a subagent it spawned, an MCP call in flight — fanned out beside
- * its shoulder rather than stacked into the single status badge above its head.
+ * Dagster job it triggered, a subagent it spawned, an MCP call in flight — fanned out level
+ * with the status badge above its head rather than stacked into that single badge.
  *
  * A status badge answers "what is this thread doing"; a task chip answers "what is it *also*
  * waiting on right now", and there can be several at once. So unlike `Indicators`, which
@@ -28,13 +29,15 @@ const COLS = 1
 const ROWS = 1
 const ICON_PATHS = [mdiCog]
 
-/** Shoulder height, below where a status badge clears the helmet. */
-const SHOULDER_CLEAR = 0.98
-/** How far to the side the nearest chip sits, and how much each further one adds. */
-const SIDE_BASE = 0.3
-const SIDE_STEP = 0.26
-/** Each chip further from the shoulder also drops a little, cascading down and out. */
-const DROP_STEP = 0.09
+/**
+ * How far to the side the nearest chip sits, and how much each further one adds — in the same
+ * distance-scaled units as `aSize`, so these have to stay close to a chip's own size (0.09) or
+ * the fan reads as floating apart from the astronaut instead of beside it. Badges only ever
+ * offset by half their own size (see the Y-lift in indicators.js); chips go a little further
+ * since they have to clear the badge and each other, but not much further.
+ */
+const SIDE_BASE = 0.16
+const SIDE_STEP = 0.09
 
 export class TaskChips {
   constructor(scene, capacity = CAPACITY) {
@@ -98,6 +101,10 @@ export class TaskChips {
           `vec4 mvPosition = viewMatrix * vec4( bcBend( ( modelMatrix * vec4( aCenter, 1.0 ) ).xyz ), 1.0 );
            float dist = -mvPosition.z;
            float distScale = 2.0 + dist * 0.22;
+           // Same lift as the status badge (see indicators.js): anchor the quad's *bottom*
+           // edge at aCenter rather than its middle, so a chip sits level with the badge
+           // instead of hanging half a chip-height below it.
+           mvPosition.y += ( aSize * distScale ) * 0.5;
            mvPosition.xy += aOffset * distScale;
            mvPosition.xy += position.xy * ( aSize * distScale );
            vFade = aFade;
@@ -165,7 +172,7 @@ export class TaskChips {
     for (const chip of this.chips.values()) {
       if (n >= this.capacity) break
       centers[n * 3] = chip.x
-      centers[n * 3 + 1] = chip.y + SHOULDER_CLEAR - chip.slot * DROP_STEP
+      centers[n * 3 + 1] = chip.y + HEAD_CLEAR
       centers[n * 3 + 2] = chip.z
       offsets[n * 2] = SIDE_BASE + chip.slot * SIDE_STEP
       offsets[n * 2 + 1] = 0

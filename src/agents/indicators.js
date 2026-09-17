@@ -27,7 +27,7 @@ const COLS = 4
 const ROWS = 2
 
 /** Where the badge's bottom edge sits: a shade above the crown of the helmet. */
-const HEAD_CLEAR = 1.42
+export const HEAD_CLEAR = 1.42
 
 export const BADGE = {
   none: -1,
