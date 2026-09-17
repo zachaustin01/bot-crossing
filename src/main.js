@@ -724,8 +724,24 @@ function applyThreads(list) {
     return at && t.lastActivityAt <= at ? { ...t, unread: false } : t
   })
   list = threads
-  const archivedSet = new Set(state.archived)
+  let archivedSet = new Set(state.archived)
   const hiddenSet = new Set(state.hiddenProjects || [])
+
+  // A thread you sent home can start running again — a Dagster job kicks off a follow-up
+  // turn, a scheduled routine wakes it, you resume it from the harness's own UI. Archiving
+  // was never "gone for good", so work showing back up should put the astronaut back on the
+  // map rather than leaving it stuck in the ship for good. `t.archived` covers the ids
+  // `reconcileArchived` matched through `ref` rather than the canonical id (see
+  // server/api.mjs), so a thread archived under an old id still comes back.
+  const revived = list.filter((t) => t.running && (archivedSet.has(t.id) || t.archived))
+  if (revived.length) {
+    const goneIds = new Set(revived.map((t) => t.id))
+    state.archived = state.archived.filter((id) => !goneIds.has(id))
+    state.archivedAt = Object.fromEntries(Object.entries(state.archivedAt).filter(([id]) => !goneIds.has(id)))
+    queueSave()
+    archivedSet = new Set(state.archived)
+    for (const t of revived) hud.toast(`${t.title || 'A thread'} is running again — back on the map`)
+  }
 
   // Which threads the colony has met before. Walking out of the ship is meant to *mean*
   // something — a thread that just appeared — and without this every reload staged a
