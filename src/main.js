@@ -727,20 +727,23 @@ function applyThreads(list) {
   let archivedSet = new Set(state.archived)
   const hiddenSet = new Set(state.hiddenProjects || [])
 
-  // A thread you sent home can start running again — a Dagster job kicks off a follow-up
-  // turn, a scheduled routine wakes it, you resume it from the harness's own UI. Archiving
-  // was never "gone for good", so work showing back up should put the astronaut back on the
-  // map rather than leaving it stuck in the ship for good. `t.archived` covers the ids
-  // `reconcileArchived` matched through `ref` rather than the canonical id (see
-  // server/api.mjs), so a thread archived under an old id still comes back.
-  const revived = list.filter((t) => t.running && (archivedSet.has(t.id) || t.archived))
+  // A thread you sent home can come back — a Dagster job kicks off a follow-up turn, a
+  // scheduled routine wakes it, you restart it from the harness's own UI. Archiving was
+  // never "gone for good", so any of that should put the astronaut back on the map rather
+  // than leaving it stuck in the ship. `t.running` alone misses a restart that is just
+  // sitting at the prompt: the CLI process is back but hasn't been handed a turn yet, so it
+  // is not `running` until it has something to do. `t.hasLiveProcess` is the process itself,
+  // independent of whether it is mid-turn — see the note on it in claude-code.mjs. `t.archived`
+  // covers the ids `reconcileArchived` matched through `ref` rather than the canonical id
+  // (see server/api.mjs), so a thread archived under an old id still comes back.
+  const revived = list.filter((t) => (t.running || t.hasLiveProcess) && (archivedSet.has(t.id) || t.archived))
   if (revived.length) {
     const goneIds = new Set(revived.map((t) => t.id))
     state.archived = state.archived.filter((id) => !goneIds.has(id))
     state.archivedAt = Object.fromEntries(Object.entries(state.archivedAt).filter(([id]) => !goneIds.has(id)))
     queueSave()
     archivedSet = new Set(state.archived)
-    for (const t of revived) hud.toast(`${t.title || 'A thread'} is running again — back on the map`)
+    for (const t of revived) hud.toast(`${t.title || 'A thread'} is back — off the ship`)
   }
 
   // Which threads the colony has met before. Walking out of the ship is meant to *mean*

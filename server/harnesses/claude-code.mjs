@@ -353,11 +353,17 @@ function mergeThread(existing, next) {
  * The session ids stay, but behind `ref` — an opaque blob the browser hands straight
  * back on open/archive, so nothing outside this file has to know what a Claude session
  * id looks like.
+ *
+ * `hasLiveProcess` is let through, unlike the rest of this bookkeeping: it is the only
+ * public signal that the CLI process itself is back, as opposed to `running`, which also
+ * requires the transcript to be mid-turn. A thread you archived and then restarted from a
+ * prompt sits there alive but not yet `running` until it is handed something to do — the
+ * colony's own auto-unarchive (see `applyThreads` in main.js) needs to see it anyway.
  */
 function toThread(t) {
   const {
     desktopSessionId, desktopSessionIds, cliSessionId, bridgeSessionId,
-    titled, hasLiveProcess, transcriptFile, recordActivityAt, ...rest
+    titled, transcriptFile, recordActivityAt, ...rest
   } = t
   return {
     ...rest,
