@@ -60,7 +60,7 @@ engine.setPlanetGrade(PLANETS[settings.get('planet')]?.grade)
 const rig = new CameraRig(engine.camera, engine.canvas, settings)
 const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer)
 
-let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {} }
+let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {}, liveIds: [] }
 let threads = []
 /**
  * Thread ids seen alive (running or a live process) as of the last poll — kept only to catch
@@ -68,6 +68,11 @@ let threads = []
  * thread you still have open is the common case, not an edge case: the CLI stays running long
  * after you have told the colony you are done with a session, so "is it alive" would undo the
  * archive on the very next poll. "Did it just become alive" only fires for an actual restart.
+ *
+ * Mirrored into `state.liveIds` and saved, because an in-memory-only set forgets everything on
+ * reload — the first poll after a refresh would otherwise see every already-alive archived
+ * thread as newly alive and revive it, which is the same bug back in a different costume.
+ * Hydrated from the saved copy in `boot()`.
  */
 let liveIds = new Set()
 /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
@@ -751,14 +756,20 @@ function applyThreads(list) {
   // `t.archived` covers the ids `reconcileArchived` matched through `ref` rather than the
   // canonical id (see server/api.mjs), so a thread archived under an old id still comes back.
   const revived = list.filter((t) => nowLive.has(t.id) && !liveIds.has(t.id) && (archivedSet.has(t.id) || t.archived))
+  // Keep the saved copy fresh whenever membership actually moves, not only when a revive
+  // happens — a stale save is what lets a reload mistake "already alive" for "just came back".
+  const liveChanged = nowLive.size !== liveIds.size || [...nowLive].some((id) => !liveIds.has(id))
   liveIds = nowLive
   if (revived.length) {
     const goneIds = new Set(revived.map((t) => t.id))
     state.archived = state.archived.filter((id) => !goneIds.has(id))
     state.archivedAt = Object.fromEntries(Object.entries(state.archivedAt).filter(([id]) => !goneIds.has(id)))
-    queueSave()
     archivedSet = new Set(state.archived)
     for (const t of revived) hud.toast(`${t.title || 'A thread'} is back — off the ship`)
+  }
+  if (revived.length || liveChanged) {
+    state.liveIds = [...liveIds]
+    queueSave()
   }
 
   // Which threads the colony has met before. Walking out of the ship is meant to *mean*
@@ -892,6 +903,7 @@ async function boot() {
     fetchState()
       .then((s) => {
         state = s
+        liveIds = new Set(state.liveIds || [])
         // Before the first roster: zones come back to the ground they were on last time.
         colony.restoreLayout(state.plots)
         // And the settings, but only for a browser that has none of its own — an explicit

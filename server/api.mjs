@@ -57,6 +57,10 @@ const emptyState = () => ({
   seen: {},
   hiddenProjects: [],
   viewedAt: {},
+  // Thread ids the browser saw alive (running or a live process) as of its last save — so a
+  // reload can tell "this was already alive" from "this just came back" instead of treating
+  // every already-alive archived thread as a fresh restart. See the note on it in main.js.
+  liveIds: [],
   settings: null,
   updatedAt: 0,
 })
@@ -76,6 +80,7 @@ async function readState() {
       seen: asObject(raw.seen),
       hiddenProjects: asArray(raw.hiddenProjects).map(String).filter(Boolean),
       viewedAt: asObject(raw.viewedAt),
+      liveIds: asArray(raw.liveIds),
       settings: raw.settings && typeof raw.settings === 'object' ? raw.settings : null,
       updatedAt: Number(raw.updatedAt) || 0,
     }
@@ -111,6 +116,7 @@ async function writeState(next) {
     seen: asObject(next.seen),
     hiddenProjects: asArray(next.hiddenProjects).map(String).filter(Boolean),
     viewedAt: asObject(next.viewedAt),
+    liveIds: asArray(next.liveIds),
     settings: next.settings && typeof next.settings === 'object' ? next.settings : null,
     updatedAt: Date.now(),
   }

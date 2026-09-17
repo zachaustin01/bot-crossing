@@ -46,6 +46,15 @@ test('hiding a repo survives a conflicting save', () => {
   assert.deepEqual(mergeState({ hiddenProjects: [] }, { hiddenProjects: [] }, { hiddenProjects: ['y'] }).hiddenProjects, ['y'])
 })
 
+test('liveIds survives a conflicting save both ways — an addition and a removal', () => {
+  // A thread coming alive in one tab while another tab saves first.
+  assert.deepEqual(mergeState({ liveIds: [] }, { liveIds: ['t1'] }, { liveIds: [] }).liveIds, ['t1'])
+  // A thread going quiet in one tab must not be pasted back by the other tab's stale copy —
+  // this is the exact failure mode that let an archived-and-still-open thread look "revived"
+  // on the very next save if the removal were dropped here.
+  assert.deepEqual(mergeState({ liveIds: ['t1'] }, { liveIds: [] }, { liveIds: ['t1'] }).liveIds, [])
+})
+
 test('settings are not merged field-wise — the last tab to touch a slider wins whole', () => {
   const out = mergeState({ settings: { q: 1 } }, { settings: { q: 3 } }, { settings: { q: 2, planet: 'mars' } })
   assert.deepEqual(out.settings, { q: 3 })
@@ -116,6 +125,14 @@ test('simultaneous saves never 500 — one wins, the rest get a mergeable 409', 
     assert.equal(codes.filter((c) => c === 409).length, 4, 'the rest are told to merge')
     assert.ok(!codes.some((c) => c >= 500), `no crashes, got ${codes}`)
     void call
+  })
+})
+
+test('liveIds round-trips through a save, same as any other list field', async () => {
+  await withServer(async ({ call, put }) => {
+    await put({ liveIds: ['claude-code:abc'] })
+    const state = await (await call('/api/state')).json()
+    assert.deepEqual(state.liveIds, ['claude-code:abc'])
   })
 })
 
