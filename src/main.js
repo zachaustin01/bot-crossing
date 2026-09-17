@@ -69,6 +69,7 @@ let selectedId = null
 let selectedProject = null
 let hoverId = null
 let statusCursor = 0
+let agentCursor = 0
 let pendingSave = 0
 const hoverGround = new THREE.Vector3()
 
@@ -121,10 +122,18 @@ const actions = {
     hud.hint(next.label)
   },
 
-  /** Fly to the next astronaut in a given state, cycling through them on repeat presses. */
-  focusStatus: (status) => {
+  /**
+   * Fly to the next astronaut in a given state, cycling through them on repeat presses.
+   * `scope: 'project'` narrows the pool to the open zone; with nothing open, or with
+   * nobody left to find there, it falls back to hunting the whole colony.
+   */
+  focusStatus: (status, { scope = 'all' } = {}) => {
     const key = status === 'agents' ? null : status
-    const pool = colony.astronauts.agents.filter((a) => (key ? a.status === key : true))
+    let pool = colony.astronauts.agents.filter((a) => (key ? a.status === key : true))
+    if (scope === 'project' && selectedProject) {
+      const local = pool.filter((a) => a.thread?.project === selectedProject)
+      if (local.length) pool = local
+    }
     if (!pool.length) {
       hud.hint(key ? `Nobody is ${(STATUS_LABEL[key] || key).toLowerCase()} right now` : 'No crew on the surface')
       return
@@ -132,6 +141,33 @@ const actions = {
     pool.sort((a, b) => a.id.localeCompare(b.id))
     const agent = pool[statusCursor++ % pool.length]
     select(agent.id, { fly: true })
+  },
+
+  /** Step to the next astronaut standing in the open zone, wrapping around. */
+  nextAgent: () => {
+    if (!selectedProject) {
+      hud.hint('Open a project first')
+      return
+    }
+    const pool = colony.astronauts.agents.filter((a) => a.thread?.project === selectedProject)
+    if (!pool.length) {
+      hud.hint('No crew in this project')
+      return
+    }
+    pool.sort((a, b) => a.id.localeCompare(b.id))
+    const agent = pool[agentCursor++ % pool.length]
+    select(agent.id, { fly: true })
+  },
+
+  /** Step to the next project in build order and land on whoever needs you most there. */
+  nextProject: () => {
+    const order = colony.plotOrder
+    if (!order.length) return
+    const idx = selectedProject ? order.findIndex((p) => p.name === selectedProject) : -1
+    const next = order[(idx + 1 + order.length) % order.length]
+    const top = topAgentInProject(next.name)
+    if (top) select(top.id, { fly: true })
+    else selectProject(next.name, { fly: true })
   },
 
   focusProject: (name) => {
@@ -400,6 +436,21 @@ function pathForProject(name) {
   return best
 }
 
+/**
+ * Whoever a zone's sidebar would list first: the same priority as `syncProject` sorts by —
+ * status rank, then most recently touched.
+ */
+function topAgentInProject(name) {
+  const now = Date.now()
+  const pool = colony.astronauts.agents
+    .filter((a) => a.thread?.project === name)
+    .sort((a, b) => {
+      const rank = STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status)
+      return rank || (b.thread?.lastActivityAt ?? 0) - (a.thread?.lastActivityAt ?? 0)
+    })
+  return pool[0] || null
+}
+
 /** Push the open zone's current contents at the sidebar. Closes it if the zone is gone. */
 function syncProject() {
   const hidden = hiddenCatalog(state.hiddenProjects || [], threads)
@@ -553,7 +604,7 @@ window.addEventListener('keydown', (e) => {
       break
     case 'n':
     case 'N':
-      actions.focusStatus('waiting')
+      actions.focusStatus('waiting', { scope: e.shiftKey ? 'all' : 'project' })
       break
     case 'p':
     case 'P':
@@ -571,6 +622,11 @@ window.addEventListener('keydown', (e) => {
     case 'M':
       settings.set('sound', !settings.get('sound'))
       hud.hint(settings.get('sound') ? 'Sound on' : 'Muted')
+      break
+    case 'b':
+    case 'B':
+      if (e.shiftKey) actions.nextProject()
+      else actions.nextAgent()
       break
     case 'Tab':
       e.preventDefault()
