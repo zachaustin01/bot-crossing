@@ -186,6 +186,11 @@ const DEFAULTS = {
   ambienceVolume: 0.8,
   effectsVolume: 0.8,
 
+  /** Off by default: a new structure on the map, not a quality knob most people expect on. */
+  mcpFactory: false,
+  /** Off by default, same reasoning as `mcpFactory` — and it polls a config endpoint of its own. */
+  usageCanister: false,
+
   // Behaviour
   autoQuality: true, // drop render scale when frames get expensive
   autoFrame: false, // ease the camera back to isometric when you stop dragging; opt-in
