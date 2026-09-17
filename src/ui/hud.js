@@ -1213,8 +1213,11 @@ const TEMPLATE = `
         <div class="k"><span>Screenshot</span><kbd>P</kbd></div>
       </div>
       <div>
-        <div class="k"><span>Next needing you</span><kbd>N</kbd></div>
+        <div class="k"><span>Next needing you (project)</span><kbd>N</kbd></div>
+        <div class="k"><span>Next needing you (anywhere)</span><kbd>⇧N</kbd></div>
         <div class="k"><span>Next agent</span><kbd>M</kbd></div>
+        <div class="k"><span>Next agent (project)</span><kbd>B</kbd></div>
+        <div class="k"><span>Next project</span><kbd>⇧B</kbd></div>
         <div class="k"><span>Open thread</span><kbd>Enter</kbd></div>
         <div class="k"><span>Mark viewed</span><kbd>V</kbd></div>
         <div class="k"><span>Archive</span><kbd>A</kbd></div>
