@@ -20,6 +20,10 @@ import { HEAD_CLEAR } from './indicators.js'
  */
 
 const FADE_SECONDS = 0.6
+/** How long a finished task's chip stays lit green before it starts fading like any other. */
+const DONE_SECONDS = 12
+/** The green a chip switches to once its call has come back. */
+const DONE_HUE = 138
 /** How many of one astronaut's tasks get a chip before the rest simply go undrawn. */
 const MAX_PER_AGENT = 4
 const CAPACITY = 96
@@ -136,38 +140,66 @@ export class TaskChips {
 
   /**
    * `agents` is `Astronauts.agents` — anyone whose `thread.activeTasks` names calls in flight
-   * gets a chip per call, fanned out beside the shoulder in the order the transcript listed them.
+   * gets a chip per call, stacked above the badge in the order the transcript listed them. A
+   * call that comes back turns its chip green and holds it up there a while longer (see
+   * `DONE_SECONDS`) rather than letting it vanish the instant the transcript moves on, so a
+   * quick call still reads as a completed thing rather than a flicker.
    */
   update(dt, elapsed, agents) {
-    const active = new Set()
+    const active = new Map() // key -> { agent, slot, task }
+    const activeSlots = new Map() // agentId -> how many active slots it used this frame
     for (const agent of agents) {
       if (agent.scale < 0.4 || agent.state === 'gone') continue
       const tasks = agent.thread?.activeTasks
       if (!tasks || !tasks.length) continue
       const slots = Math.min(tasks.length, MAX_PER_AGENT)
+      activeSlots.set(agent.id, slots)
       for (let slot = 0; slot < slots; slot++) {
         const task = tasks[slot]
         if (!task?.id) continue
-        const key = `${agent.id}:${task.id}`
-        active.add(key)
-        let chip = this.chips.get(key)
-        if (!chip) {
-          const hue = hashString(task.mcpServer || task.tool || task.id) % 360
-          chip = { hold: 0, x: agent.pos.x, y: agent.pos.y, z: agent.pos.z, hue, slot }
-          this.chips.set(key, chip)
-        }
-        chip.slot = slot
-        chip.x = agent.pos.x
-        chip.y = agent.pos.y
-        chip.z = agent.pos.z
-        chip.hold = Math.min(1, chip.hold + dt * 6)
+        active.set(`${agent.id}:${task.id}`, { agent, slot, task })
       }
     }
 
+    for (const [key, { agent, slot, task }] of active) {
+      let chip = this.chips.get(key)
+      if (!chip) {
+        const hue = hashString(task.mcpServer || task.tool || task.id) % 360
+        chip = { hold: 0, x: agent.pos.x, y: agent.pos.y, z: agent.pos.z, hue, slot, agentId: agent.id, done: false, doneTimer: 0 }
+        this.chips.set(key, chip)
+      }
+      chip.agentId = agent.id
+      chip.slot = slot
+      chip.done = false
+      chip.x = agent.pos.x
+      chip.y = agent.pos.y
+      chip.z = agent.pos.z
+      chip.hold = Math.min(1, chip.hold + dt * 6)
+    }
+
+    // Chips whose call is no longer in flight: hold green and fully lit for DONE_SECONDS, then
+    // fade like usual. Slots continue from wherever that astronaut's active tasks left off, so
+    // a finished chip stacks above the ones still running rather than colliding with them.
+    const nextSlot = new Map(activeSlots)
     for (const [key, chip] of this.chips) {
       if (active.has(key)) continue
-      chip.hold -= dt / FADE_SECONDS
-      if (chip.hold <= 0) this.chips.delete(key)
+      if (!chip.done) {
+        chip.done = true
+        chip.doneTimer = DONE_SECONDS
+      }
+      if (chip.doneTimer > 0) {
+        chip.doneTimer -= dt
+        chip.hold = Math.min(1, chip.hold + dt * 6)
+      } else {
+        chip.hold -= dt / FADE_SECONDS
+      }
+      if (chip.hold <= 0) {
+        this.chips.delete(key)
+        continue
+      }
+      const slot = nextSlot.get(chip.agentId) || 0
+      chip.slot = slot
+      nextSlot.set(chip.agentId, slot + 1)
     }
 
     const centers = this.centers.array
@@ -184,7 +216,8 @@ export class TaskChips {
       offsets[n * 2 + 1] = STACK_BASE + chip.slot * STACK_STEP
       sizes[n] = 0.09 + Math.sin(elapsed * 3.6 + chip.slot) * 0.006
       fades[n] = Math.max(0, chip.hold)
-      this._color.setHSL(chip.hue / 360, 0.6, 0.6)
+      const hue = chip.done ? DONE_HUE : chip.hue
+      this._color.setHSL(hue / 360, 0.6, 0.6)
       this.mesh.setColorAt(n, this._color)
       n++
     }
