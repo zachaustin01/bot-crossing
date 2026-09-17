@@ -65,17 +65,18 @@ function monthBounds(at = Date.now()) {
 }
 
 /**
- * Dollars per million tokens, by pricing tier. A model's rate has held steady across every
- * Claude generation released so far, so this keys off the tier named in the model id rather
- * than a table that needs a new row on every release. `ccusage` pulls the equivalent table
- * fresh off the network, from LiteLLM's pricing data; this is a frozen copy of Anthropic's
- * published rates at the time it was written, so the canister keeps working offline — and
- * needs revisiting if a future tier's pricing actually moves.
+ * Dollars per million tokens, by pricing tier. This keys off the tier named in the model id
+ * rather than a table keyed on exact model id, so a new model in an existing tier doesn't need
+ * a new row. `ccusage` pulls the equivalent table fresh off the network, from LiteLLM's pricing
+ * data; this is a frozen copy of Anthropic's published rates at the time it was written — each
+ * generation has priced its tiers differently (the 5/4.5 generation is not a flat multiple of
+ * the previous one), so this needs revisiting whenever a new generation ships, not just when a
+ * tier's price moves.
  */
 const PRICING = {
-  opus: { input: 15, output: 75, cacheWrite5m: 18.75, cacheWrite1h: 30, cacheRead: 1.5 },
-  sonnet: { input: 3, output: 15, cacheWrite5m: 3.75, cacheWrite1h: 6, cacheRead: 0.3 },
-  haiku: { input: 0.8, output: 4, cacheWrite5m: 1, cacheWrite1h: 1.6, cacheRead: 0.08 },
+  opus: { input: 5, output: 25, cacheWrite5m: 6.25, cacheWrite1h: 10, cacheRead: 0.5 },
+  sonnet: { input: 2, output: 10, cacheWrite5m: 2.5, cacheWrite1h: 4, cacheRead: 0.2 },
+  haiku: { input: 1, output: 5, cacheWrite5m: 1.25, cacheWrite1h: 2, cacheRead: 0.1 },
 }
 
 /** Sonnet is both the middle tier and the safest guess for a model id this table has never
@@ -113,6 +114,25 @@ function costFor(usage, model) {
  * has its *new* bytes read — the same trick `tail -f` uses.
  */
 const fileCache = new Map()
+
+/**
+ * `ccusage` dedupes assistant turns by `(message.id, requestId, sessionId)` before pricing them,
+ * because the same turn legitimately shows up more than once on disk: a subagent's transcript
+ * replays its parent's messages, and a resumed or forked session can carry an earlier session's
+ * lines forward into a new file. Without this, those replays get priced a second time and the
+ * canister burns down noticeably faster than the account actually is. This set is keyed
+ * per-scan-position the same way `fileCache` is — a key, once seen, stays excluded even if the
+ * file that first produced it is later trimmed off the front of the month.
+ */
+const seenTurns = new Set()
+
+function dedupeKey(obj) {
+  const messageId = obj.message?.id
+  if (!messageId) return null
+  const requestId = obj.requestId || ''
+  const sessionId = obj.sessionId || obj.session_id || ''
+  return `${messageId}:${requestId}:${sessionId}`
+}
 
 async function* transcriptFiles() {
   let projectDirs
@@ -169,6 +189,11 @@ async function readNewEntries(filePath, cached) {
       try {
         const obj = JSON.parse(line)
         if (obj.type !== 'assistant' || !obj.message?.usage) continue
+        const key = dedupeKey(obj)
+        if (key) {
+          if (seenTurns.has(key)) continue
+          seenTurns.add(key)
+        }
         const ts = Date.parse(obj.timestamp)
         const usd = costFor(obj.message.usage, obj.message.model)
         if (Number.isFinite(ts) && usd > 0) {
