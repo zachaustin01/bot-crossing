@@ -91,6 +91,7 @@ what earns a repo its own zone, and `lastActivityAt` is what sorts the whole map
 | `running` | boolean | Working **right now** — the astronaut hammers away |
 | `unread` | boolean | Moved on since you last looked — the astronaut stops and holds a `?` |
 | `hasError` | boolean | Errored — the astronaut slumps, red eyes |
+| `blocked` | boolean | Sitting at a permission prompt, waiting for you to approve a tool call — the astronaut waves and its lamp beacons. Optional; a harness with no way to detect this just never sets it |
 | `starred` / `routine` / `prState` | | Optional extras; `prState: 'merged'` triggers the confetti |
 | `archived` | boolean | Archived in the harness's own records. Read-only — reporting it is all an adapter does |
 | `sizeBytes` | number | Transcript size. **This is how finished a building looks**, on a log scale |

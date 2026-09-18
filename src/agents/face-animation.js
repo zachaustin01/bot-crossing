@@ -24,7 +24,7 @@ export function animateFace(agent, dt, anim = 1) {
   // thread. A brief speed dip at a waypoint must not flicker between two different moods.
   const travelling = (agent.state === 'spawning' || agent.state === 'walking' ||
     (agent.state === 'at-site' && agent.status === 'idle')) &&
-    agent.status !== 'blocked' && agent.status !== 'broken'
+    agent.status !== 'blocked' && agent.status !== 'broken' && agent.status !== 'approval'
   if (!travelling) agent.walkFaceHold = 0
   else if (agent.groundSpeed > 0.12 || agent.state === 'spawning') agent.walkFaceHold = 0.3
   else agent.walkFaceHold = Math.max(0, agent.walkFaceHold - dt)
@@ -38,7 +38,7 @@ export function animateFace(agent, dt, anim = 1) {
   // Closed happy eyes do not blink open or move the whistling mouth. The open-eyed
   // walking variant has its own blink with the very same smile placement.
   if (agent.blinkAt <= 0 && (agent.status !== 'sleeping' || strolling) &&
-    agent.status !== 'blocked' && agent.status !== 'broken') {
+    agent.status !== 'blocked' && agent.status !== 'broken' && agent.status !== 'approval') {
     agent.faceFrame = strolling ? (WALK_BLINK[walkFace] ?? walkFace) : FACE.blink
     if (agent.blinkAt < -0.12) agent.blinkAt = 2.4 + Math.random() * 5
     return

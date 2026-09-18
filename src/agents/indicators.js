@@ -10,6 +10,7 @@ import {
   mdiSleep,
   mdiCreation,
   mdiLogout,
+  mdiShieldAlert,
 } from '@mdi/js'
 
 /**
@@ -23,7 +24,7 @@ import {
  */
 
 const COLS = 4
-const ROWS = 2
+const ROWS = 3
 
 /** Where the badge's bottom edge sits: a shade above the crown of the helmet. */
 const HEAD_CLEAR = 1.42
@@ -38,6 +39,7 @@ export const BADGE = {
   sleeping: 5,
   spawning: 6,
   leaving: 7,
+  approval: 8, // sitting at a permission prompt
 }
 
 /** HDR badge tint, tone-mapped with the scene after bloom and depth of field. */
@@ -50,6 +52,7 @@ const BADGE_COLOR = {
   5: [0.9, 1.0, 1.7],
   6: [2.4, 1.4, 0.75],
   7: [1.2, 1.3, 1.35],
+  8: [2.7, 1.75, 0.4],
 }
 
 /**
@@ -59,6 +62,7 @@ const BADGE_COLOR = {
 const FADE_BY_BADGE = {
   [BADGE.waiting]: 0,
   [BADGE.blocked]: 0,
+  [BADGE.approval]: 0,
   [BADGE.done]: 0.15,
   [BADGE.working]: 0.4,
   [BADGE.spawning]: 0.5,
@@ -261,7 +265,17 @@ export class Indicators {
  * — the glyph has to carry as a silhouette. Material's set is drawn filled to begin with,
  * one closed path per icon, so there is nothing to stroke and nothing to parse.
  */
-const ICON_PATHS = [mdiHelpCircle, mdiAlert, mdiHammer, mdiCheckBold, mdiPause, mdiSleep, mdiCreation, mdiLogout]
+const ICON_PATHS = [
+  mdiHelpCircle,
+  mdiAlert,
+  mdiHammer,
+  mdiCheckBold,
+  mdiPause,
+  mdiSleep,
+  mdiCreation,
+  mdiLogout,
+  mdiShieldAlert,
+]
 
 /**
  * The badge atlas. Red channel = the glyph, green channel = the plate's alpha — packing two

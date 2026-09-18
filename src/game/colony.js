@@ -71,12 +71,13 @@ const LIVE_GROWTH = 0.004
 /** How many zones' positions to remember, including repos with nothing running in them. */
 const LAYOUT_MEMORY = 80
 
-export const STATUS_ORDER = ['blocked', 'waiting', 'working', 'celebrating', 'idle', 'sleeping']
+export const STATUS_ORDER = ['blocked', 'approval', 'waiting', 'working', 'celebrating', 'idle', 'sleeping']
 
 export const STATUS_LABEL = {
   working: 'Working',
   waiting: 'Waiting on you',
   blocked: 'Blocked',
+  approval: 'Needs approval',
   celebrating: 'Shipped',
   idle: 'Idle',
   sleeping: 'Dormant',
@@ -87,6 +88,9 @@ export const STATUS_LABEL = {
 /** Thread → behaviour. First match wins, exactly like the board's auto-sort. */
 export function statusFor(thread, now = Date.now()) {
   if (thread.hasError) return 'blocked'
+  // Sitting at a permission prompt outranks "working": the process is alive, but it has
+  // stopped and it wants you specifically, same as a thread that handed the turn back.
+  if (thread.blocked) return 'approval'
   if (thread.running) return 'working'
   if (thread.prState === 'MERGED') return 'celebrating'
   if (thread.unread) return 'waiting'
@@ -102,6 +106,7 @@ export function statusFor(thread, now = Date.now()) {
 const BADGE_FOR = {
   waiting: BADGE.waiting,
   blocked: BADGE.blocked,
+  approval: BADGE.approval,
   working: BADGE.working,
   celebrating: BADGE.done,
   sleeping: BADGE.none,
@@ -595,8 +600,8 @@ export class Colony {
         const i = slotOf.get(thread.id)
         const status = statusFor(thread, now)
         if (stats[status] !== undefined) stats[status]++
-        if (status === 'waiting' || status === 'blocked') urgent.add(plot.id)
-        if (status === 'waiting' || status === 'blocked' || status === 'working') active.add(plot.id)
+        if (status === 'waiting' || status === 'blocked' || status === 'approval') urgent.add(plot.id)
+        if (status === 'waiting' || status === 'blocked' || status === 'approval' || status === 'working') active.add(plot.id)
         stats.agents++
 
         const building = this._syncBuilding(thread, plot, i)

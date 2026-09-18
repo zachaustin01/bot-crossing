@@ -39,6 +39,7 @@ const AGENT_LOOK = {
   working: { trim: 0x4f9a63, eye: [0.35, 2.5, 1.15] },
   waiting: { trim: 0x4f7ec9, eye: [0.45, 1.5, 3.0] },
   blocked: { trim: 0xc94f4f, eye: [3.0, 0.5, 0.45] },
+  approval: { trim: 0xd6a23f, eye: [2.7, 1.75, 0.4] },
   celebrating: { trim: 0xc9a24f, eye: [2.9, 2.1, 0.6] },
   idle: { trim: 0x8b8b85, eye: [1.1, 1.5, 1.7] },
   sleeping: { trim: 0x5a5a70, eye: [0.7, 0.8, 1.4] },
@@ -49,7 +50,7 @@ const AGENT_LOOK = {
 const WALK_SPEED = 2.1
 
 /** Who survives a display cap: the ones that want you, then the ones doing something. */
-const ROSTER_RANK = { blocked: 0, waiting: 1, working: 2, celebrating: 3, idle: 4, sleeping: 5 }
+const ROSTER_RANK = { blocked: 0, approval: 1, waiting: 2, working: 3, celebrating: 4, idle: 5, sleeping: 6 }
 const rosterRank = (entry) => ROSTER_RANK[entry.status] ?? 6
 const TURN_RATE = 7.5
 /**
@@ -1399,6 +1400,9 @@ export class Astronauts {
           } else key = 'work'
           break
         case 'waiting':
+        // Sitting at a permission prompt reads the same in the body as waiting on you — it
+        // is, after all, exactly that — and stays told apart by badge, lamp and eye colour.
+        case 'approval':
           key = 'wave'
           break
         case 'blocked':
@@ -1533,11 +1537,14 @@ export class Astronauts {
         staticDirty = true
       }
 
-      // Antenna tip and chest lamp pulse; a blocked agent's lamp stutters like a fault light.
+      // Antenna tip and chest lamp pulse; a blocked agent's lamp stutters like a fault light,
+      // and one waiting on a permission decision beacons steadily, like a hazard light.
       const pulse =
         agent.status === 'blocked'
           ? (Math.sin(elapsed * 9) > 0.2 ? 1 : 0.05)
-          : 0.55 + 0.45 * Math.sin(elapsed * 2.6 + agent.phase)
+          : agent.status === 'approval'
+            ? (Math.sin(elapsed * 4) > 0 ? 1 : 0.15)
+            : 0.55 + 0.45 * Math.sin(elapsed * 2.6 + agent.phase)
       tip.setColorAt(i, c.copy(agent.eye).multiplyScalar(0.6 + pulse * 1.1))
       lamp.setColorAt(i, c.copy(agent.trim).multiplyScalar(0.7 + pulse * 1.6))
 

@@ -784,6 +784,9 @@ body {
 .stat.blocked {
   color: #e88b8b;
 }
+.stat.approval {
+  color: #e0b25a;
+}
 .stat.done {
   color: #e6c67f;
 }
@@ -1161,6 +1164,9 @@ body {
 }
 .side .thread.blocked {
   color: #e88b8b;
+}
+.side .thread.approval {
+  color: #e0b25a;
 }
 .side .thread.done {
   color: #e6c67f;

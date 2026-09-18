@@ -51,6 +51,7 @@ const ICON = {
 const STAT_DEFS = [
   { key: 'working', label: 'building', cls: 'working' },
   { key: 'waiting', label: 'need you', cls: 'waiting' },
+  { key: 'approval', label: 'needs approval', cls: 'approval' },
   { key: 'blocked', label: 'blocked', cls: 'blocked' },
   { key: 'celebrating', label: 'shipped', cls: 'done' },
   { key: 'agents', label: 'crew', cls: 'idle' },
@@ -443,7 +444,7 @@ export class Hud {
     on('#btn-help', 'click', () => this.toggleHelp())
     on('#btn-shot', 'click', () => this.actions.screenshot?.())
     on('#btn-home', 'click', () => this.actions.resetView?.())
-    on('#btn-next', 'click', () => this.actions.focusStatus?.('waiting'))
+    on('#btn-next', 'click', () => this.actions.focusStatus?.(['waiting', 'approval', 'blocked']))
     on('#btn-orbit', 'click', () => this.setOrbit(this.actions.toggleOrbit?.()))
     on('#btn-planet', 'click', () => this.actions.cyclePlanet?.())
     on('#btn-time', 'click', () => this.actions.cycleTime?.())
@@ -643,7 +644,9 @@ export class Hud {
     this.$('#btn-copy-path').disabled = !project.path
 
     const n = project.threads.length
-    const waiting = project.threads.filter((t) => t.status === 'waiting' || t.status === 'blocked').length
+    const waiting = project.threads.filter(
+      (t) => t.status === 'waiting' || t.status === 'blocked' || t.status === 'approval'
+    ).length
     this.$('.side .threads-head').innerHTML =
       `<span>${n} thread${n === 1 ? '' : 's'}</span>` + (waiting ? `<span class="want">${waiting} need you</span>` : '')
 
@@ -1012,6 +1015,7 @@ function statusClass(status) {
   if (status === 'working') return 'working'
   if (status === 'waiting') return 'waiting'
   if (status === 'blocked') return 'blocked'
+  if (status === 'approval') return 'approval'
   if (status === 'celebrating') return 'done'
   return 'idle'
 }
@@ -1120,7 +1124,7 @@ const TEMPLATE = `
 
 <div class="rail panel">
   <button class="btn icon" id="btn-home" title="Reset the view (0)">${ICON.home}</button>
-  <button class="btn icon" id="btn-next" title="Next astronaut waiting on you (N)">${ICON.next}</button>
+  <button class="btn icon" id="btn-next" title="Next astronaut that needs you (N)">${ICON.next}</button>
   <div class="sep"></div>
   <button class="btn icon" id="btn-orbit" title="Orbit mode — sweep around the colony (O)" aria-pressed="false">${ICON.orbit}</button>
   <button class="btn icon" id="btn-planet" title="Change planet (Tab)">${ICON.globe}</button>

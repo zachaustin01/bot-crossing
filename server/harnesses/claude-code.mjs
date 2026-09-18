@@ -78,6 +78,14 @@ const DESKTOP_SESSIONS = path.join(desktopDataDir(), 'claude-code-sessions')
 const CLI_PROJECTS = path.join(HOME, '.claude', 'projects')
 /** One file per live CLI process: {pid, sessionId, cwd, ...}. Stale files outlive their pid. */
 const CLI_LIVE = path.join(HOME, '.claude', 'sessions')
+/**
+ * One marker file per session sitting at a permission prompt right now, named `<sessionId>.json`.
+ * Nothing here writes it — a `Notification` hook the user installs themselves (see
+ * `server/hooks/README.md`) drops the file when the prompt appears and removes it once the tool
+ * proceeds or is denied. Deliberately outside `~/.claude`: that directory is Claude Code's own,
+ * and this adapter is read-only against it, same as everything else in this file.
+ */
+const BLOCKED_DIR = path.join(HOME, '.bot-crossing', 'blocked')
 
 const HEAD_BYTES = 192 * 1024
 
@@ -428,6 +436,29 @@ async function scanLiveSessions() {
   return live
 }
 
+/**
+ * Sessions the permission-prompt hook has marked as sitting at a prompt right now. A stale
+ * marker left behind by a session that crashed before its hook could clean up would wrongly
+ * pin a thread as blocked forever, so a marker older than a live prompt could plausibly stay
+ * open is dropped rather than trusted.
+ */
+const BLOCKED_MARKER_MAX_AGE_MS = 60 * 60 * 1000
+async function scanBlockedSessions() {
+  const blocked = new Set()
+  for (const file of await listFiles(BLOCKED_DIR, (n) => n.endsWith('.json'))) {
+    let record
+    try {
+      record = JSON.parse(await fsp.readFile(file, 'utf8'))
+    } catch {
+      continue
+    }
+    if (!record.sessionId) continue
+    if (Date.now() - (num(record.at) || 0) > BLOCKED_MARKER_MAX_AGE_MS) continue
+    blocked.add(record.sessionId)
+  }
+  return blocked
+}
+
 /** Every thread the desktop app has a record for. */
 async function scanDesktopSessions() {
   const out = []
@@ -501,10 +532,11 @@ function toThread(t) {
 }
 
 async function scanThreads() {
-  const [desktop, transcripts, live] = await Promise.all([
+  const [desktop, transcripts, live, blockedSessions] = await Promise.all([
     scanDesktopSessions(),
     scanTranscripts(),
     scanLiveSessions(),
+    scanBlockedSessions(),
   ])
   const byId = new Map()
   const add = (thread) => {
@@ -633,10 +665,13 @@ async function scanThreads() {
     const fresh = now - thread.lastActivityAt < ACTIVE_WINDOW_MS
     const waiting =
       thread.hasLiveProcess && fresh && thread.transcriptFile ? await awaitingReply(thread.transcriptFile) : false
-    thread.running = thread.hasLiveProcess && fresh && !waiting
+    const blocked = blockedSessions.has(thread.cliSessionId)
+    thread.running = thread.hasLiveProcess && fresh && !waiting && !blocked
+    thread.blocked = blocked
     // A thread that handed the turn back wants you, whether or not the desktop app has ever seen
-    // it — the only way a terminal-only thread can ask for anything at all.
-    if (waiting) thread.unread = true
+    // it — the only way a terminal-only thread can ask for anything at all. A permission prompt
+    // wants you the same way.
+    if (waiting || blocked) thread.unread = true
   }
 
   // Which MCP tools got called since the last scan, grouped back onto the thread that made

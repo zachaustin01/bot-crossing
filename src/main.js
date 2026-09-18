@@ -126,12 +126,22 @@ const actions = {
     hud.hint(next.label)
   },
 
-  /** Fly to the next astronaut in a given state, cycling through them on repeat presses. */
+  /**
+   * Fly to the next astronaut in a given state, cycling through them on repeat presses.
+   * `status` is usually one key (what a HUD stat pill jumps to), but the "needs you" shortcut
+   * passes every state that wants attention, so one press covers all of them.
+   */
   focusStatus: (status) => {
-    const key = status === 'agents' ? null : status
-    const pool = colony.astronauts.agents.filter((a) => (key ? a.status === key : true))
+    const keys = status === 'agents' ? null : Array.isArray(status) ? status : [status]
+    const pool = colony.astronauts.agents.filter((a) => (keys ? keys.includes(a.status) : true))
     if (!pool.length) {
-      hud.hint(key ? `Nobody is ${(STATUS_LABEL[key] || key).toLowerCase()} right now` : 'No crew on the surface')
+      hud.hint(
+        keys
+          ? keys.length > 1
+            ? 'Nobody needs you right now'
+            : `Nobody is ${(STATUS_LABEL[keys[0]] || keys[0]).toLowerCase()} right now`
+          : 'No crew on the surface'
+      )
       return
     }
     pool.sort((a, b) => a.id.localeCompare(b.id))
@@ -605,7 +615,7 @@ window.addEventListener('keydown', (e) => {
       break
     case 'n':
     case 'N':
-      actions.focusStatus('waiting')
+      actions.focusStatus(['waiting', 'approval', 'blocked'])
       break
     case 'p':
     case 'P':
@@ -776,7 +786,8 @@ function chimeForNewWaiting(list, archivedSet, hiddenSet) {
   const waiting = new Set()
   for (const t of list) {
     if (archivedSet.has(t.id) || hiddenSet.has(t.project)) continue
-    if (statusFor(t, now) === 'waiting') waiting.add(t.id)
+    const status = statusFor(t, now)
+    if (status === 'waiting' || status === 'approval') waiting.add(t.id)
   }
   if (seenFirstRoster) {
     for (const id of waiting) {
