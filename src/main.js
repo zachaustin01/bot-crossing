@@ -6,11 +6,18 @@ import { CameraRig } from './core/camera.js'
 import { Colony, STATUS_LABEL, STATUS_ORDER, statusFor, transcriptProgress } from './game/colony.js'
 import { Hud } from './ui/hud.js'
 import { PLANETS } from './world/planet.js'
+import { DECK_TOP, PLOT_CELL, hexToWorld, worldToHex } from './world/plots.js'
+import { planMove } from './world/plot-move.js'
 import { loadKit } from './world/kit.js'
 import { crewRig, loadCrew } from './agents/crew.js'
 import { TIMES } from './world/sky.js'
+import { CURVE_FULL, bendPoint, installWorldCurve, setCurveView } from './core/curve.js'
+import { Ambience } from './audio/ambience.js'
+import { shorelinePoints } from './world/planet.js'
+import { shipPosition } from './world/plots.js'
 import {
   fetchThreads,
+  fetchUsage,
   fetchState,
   saveState,
   openThread,
@@ -20,6 +27,7 @@ import {
 } from './game/api.js'
 import { sortHarnessChoices, harnessReason } from './game/harnesses.js'
 import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-projects.js'
+import { withErrands } from './game/errands.js'
 
 /**
  * Boot and the outer game loop.
@@ -43,9 +51,16 @@ app.insertAdjacentHTML(
 )
 
 const settings = new Settings()
-if (!hasStoredSettings()) settings.applyPreset(DEFAULT_PRESET)
+// A phone gets the light preset the first time: a retina panel at full scale with bloom
+// and shadows is more than its GPU wants to do at sixty, and the governor only ever finds
+// that out by stuttering first.
+const phoneLike = window.matchMedia('(max-width: 600px)').matches || (window.matchMedia('(pointer: coarse)').matches && window.innerWidth < 900)
+if (!hasStoredSettings()) settings.applyPreset(phoneLike ? 'low' : DEFAULT_PRESET)
 
+// Before the first material compiles: the bend is patched into three's own shader chunks.
+installWorldCurve()
 const engine = new Engine(settings).mount(app)
+engine.setPlanetGrade(PLANETS[settings.get('planet')]?.grade)
 const rig = new CameraRig(engine.camera, engine.canvas, settings)
 const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer)
 
@@ -62,13 +77,25 @@ let hoverId = null
 let statusCursor = 0
 /** Sorted `/api/harnesses` answer, fetched on first picker open — see `harnessChoices`. */
 let harnessChoicesCache = null
+let busiestCursor = 0
 let pendingSave = 0
+/** The last usage figure the poll saw, so a budget-only settings change can redraw the
+ *  readout without waiting on the next poll. */
+let lastSpend = 0
 const hoverGround = new THREE.Vector3()
 
 // ── actions the HUD can trigger ────────────────────────────────────────────────────────
 
 const actions = {
-  resetView: () => rig.resetView(),
+  viewportChanged: ({ width, height, right, bottom }) => {
+    rig.setViewportInsets(width, height, { right, bottom })
+    engine.tiltShift?.setCamera(engine.camera)
+  },
+
+  resetView: () => {
+    if (rig.following) select(null, {})
+    rig.resetView()
+  },
 
   screenshot: () => {
     // Render one more frame, then read the buffer before the compositor clears it — the
@@ -106,12 +133,22 @@ const actions = {
     hud.hint(next.label)
   },
 
-  /** Fly to the next astronaut in a given state, cycling through them on repeat presses. */
+  /**
+   * Fly to the next astronaut in a given state, cycling through them on repeat presses.
+   * `status` is usually one key (what a HUD stat pill jumps to), but the "needs you" shortcut
+   * passes every state that wants attention, so one press covers all of them.
+   */
   focusStatus: (status) => {
-    const key = status === 'agents' ? null : status
-    const pool = colony.astronauts.agents.filter((a) => (key ? a.status === key : true))
+    const keys = status === 'agents' ? null : Array.isArray(status) ? status : [status]
+    const pool = colony.astronauts.agents.filter((a) => (keys ? keys.includes(a.status) : true))
     if (!pool.length) {
-      hud.hint(key ? `Nobody is ${(STATUS_LABEL[key] || key).toLowerCase()} right now` : 'No crew on the surface')
+      hud.hint(
+        keys
+          ? keys.length > 1
+            ? 'Nobody needs you right now'
+            : `Nobody is ${(STATUS_LABEL[keys[0]] || keys[0]).toLowerCase()} right now`
+          : 'No crew on the surface'
+      )
       return
     }
     pool.sort((a, b) => a.id.localeCompare(b.id))
@@ -119,9 +156,57 @@ const actions = {
     select(agent.id, { fly: true })
   },
 
+  /**
+   * Cycle to the next crew member. In-project by default when a zone's sidebar is open —
+   * out-of-project (the whole colony) when there is no zone open, or when asked for
+   * explicitly (the shift-modified binding), so the same key can mean either without a
+   * separate pair of bindings to keep in sync.
+   */
+  focusAgent: ({ crossProject = false } = {}) => {
+    const scoped = !crossProject && selectedProject
+    const pool = colony.astronauts.agents.filter((a) => !scoped || a.thread?.project === selectedProject)
+    if (!pool.length) {
+      hud.hint(scoped ? `Nobody in ${selectedProject} right now` : 'No crew on the surface')
+      return
+    }
+    pool.sort((a, b) => a.id.localeCompare(b.id))
+    const from = pool.findIndex((a) => a.id === selectedId)
+    const agent = pool[(from + 1 + pool.length) % pool.length]
+    select(agent.id, { fly: true })
+  },
+
+  /** Step to the next repo, wrapping — the same order the legend lists them in. */
+  cycleProject: () => {
+    const order = colony.plotOrder
+    if (!order.length) {
+      hud.hint('No projects yet')
+      return
+    }
+    const from = order.findIndex((p) => p.id === selectedProject)
+    const plot = order[(from + 1) % order.length]
+    selectProject(plot.id, { fly: true })
+  },
+
+  /**
+   * Jump to whoever has been busiest lately, cycling through the ranking on repeat presses.
+   * "Busiest" is a proxy for now — most recently active thread — until real per-agent spend
+   * or call counts exist to rank by instead.
+   */
+  focusBusiest: () => {
+    const pool = colony.astronauts.agents
+    if (!pool.length) {
+      hud.hint('No crew on the surface')
+      return
+    }
+    const ranked = [...pool].sort((a, b) => (b.thread?.lastActivityAt || 0) - (a.thread?.lastActivityAt || 0))
+    const agent = ranked[busiestCursor++ % ranked.length]
+    select(agent.id, { fly: true })
+  },
+
   focusProject: (name) => {
     const plot = colony.plots.get(name)
     if (!plot) return
+    if (rig.following) select(null, {})
     rig.focus(plot.middle || plot.center, { distance: 30 })
   },
 
@@ -157,8 +242,9 @@ const actions = {
     }
     try {
       const harness = harnessId || harnessForProject(name)
-      await newSession(folder, harness)
-      hud.toast(`New thread in ${name} — opening ${labelForHarness(harness)}`)
+      const shown = await newSession(folder, harness, settings.get('openIn'))
+      const label = labelForHarness(harness)
+      hud.toast(`New thread in ${name} — ${shown.via === 'terminal' ? `${label} in a terminal` : `opening ${label}`}`)
       // It lands as an astronaut walking down the ramp, once it has a record to scan.
       setTimeout(poll, 6000)
     } catch (err) {
@@ -257,9 +343,10 @@ const actions = {
     const thread = threads.find((t) => t.id === selectedId)
     if (!thread) return
     try {
-      await openThread(thread)
+      const shown = await openThread(thread, settings.get('openIn'))
       colony.astronauts.celebrate(thread.id)
-      hud.toast(`Opened in ${thread.harnessName || 'your harness'}`)
+      const name = thread.harnessName || 'your harness'
+      hud.toast(shown.via === 'terminal' ? `Opened ${name} in a terminal` : `Opened in ${name}`)
       // Opening is the thing that makes a thread no longer unread, so refresh shortly after.
       setTimeout(poll, 1800)
     } catch (err) {
@@ -302,19 +389,28 @@ const actions = {
   },
 }
 
+/**
+ * Sound. Beds per world, things calling out on their own clocks, and positional sources
+ * for whatever is actually making noise — a site being hammered at, the lander, a drone
+ * going past — attenuated by distance from the camera, so leaning in is turning it up.
+ */
+const ambience = new Ambience(settings)
+ambience.setPlanet(colony.planet)
+colony.onSound = (name, x, y, z) => ambience.play(name, { x, y, z, kind: colony.fauna.flock?.kind })
+
 const hud = new Hud(app, settings, actions)
-// The sidebar is permanent, so the card beside an astronaut has a wall to stay clear of.
-const sideWidth = () => (window.innerWidth <= 820 ? 0 : 334)
-hud.setSideWidth(sideWidth())
-window.addEventListener('resize', () => hud.setSideWidth(sideWidth()))
 
 // ── selection ─────────────────────────────────────────────────────────────────────────
+
+let lastVoiced = null
+let lastPhrase = 0
 
 function select(id, { fly = false } = {}) {
   selectedId = id
   const agent = id ? colony.agentFor(id) : null
   if (!agent) {
     selectedId = null
+    rig.setFollow(null)
     colony.astronauts.setSelected(null)
     hud.setSelection(null, null)
     syncProject()
@@ -323,12 +419,21 @@ function select(id, { fly = false } = {}) {
   colony.astronauts.setSelected(agent)
   const thread = threads.find((t) => t.id === id) || agent.thread
   hud.setSelection(agent, thread)
+  // It answers. One of six little phrases, from where it is standing, never twice in a row.
+  if (agent.id !== lastVoiced) {
+    lastVoiced = agent.id
+    let n = 1 + Math.floor(Math.random() * 6)
+    if (n === lastPhrase) n = (n % 6) + 1
+    lastPhrase = n
+    ambience.play(`select-${n}`, { x: agent.pos.x, y: agent.pos.y + 0.8, z: agent.pos.z, gain: 0.9 })
+  }
   // Picking somebody is also picking the zone they are standing on: the sidebar follows.
   if (thread?.project && colony.plots.has(thread.project)) selectedProject = thread.project
   syncProject()
   if (fly) {
     rig.focus(new THREE.Vector3(agent.pos.x, 0, agent.pos.z), { distance: Math.min(rig.desiredDistance, 26) })
   }
+  rig.setFollow(settings.get('followSelected') ? agent : null)
 }
 
 /** Open a zone's sidebar. Any selected astronaut from a different zone lets go. */
@@ -453,7 +558,7 @@ function syncProject() {
  */
 const cardAnchor = new THREE.Vector3()
 function screenOf(agent) {
-  cardAnchor.set(agent.pos.x, agent.pos.y + 0.95, agent.pos.z).project(engine.camera)
+  bendPoint(cardAnchor.set(agent.pos.x, agent.pos.y + 0.95, agent.pos.z)).project(engine.camera)
   if (cardAnchor.z > 1) return null
   const { w, h } = engine.viewport
   return { x: (cardAnchor.x * 0.5 + 0.5) * w, y: (-cardAnchor.y * 0.5 + 0.5) * h }
@@ -482,7 +587,9 @@ engine.canvas.addEventListener('pointermove', (e) => {
   // Pointing at a quiet plot is what makes its name appear.
   const plot = plotUnder(e, p)
   colony.setHoveredPlot(plot)
-  engine.canvas.style.cursor = agent || plot ? 'pointer' : 'grab'
+  // A plot is grabbable as well as clickable, so it gets the hand rather than the finger:
+  // 'pointer' promised only a click and hid the hold-to-drag entirely.
+  engine.canvas.style.cursor = agent ? 'pointer' : 'grab'
 })
 
 /**
@@ -497,6 +604,256 @@ function plotUnder(e, p) {
   return ground ? colony.plotAt(ground.x, ground.z) : null
 }
 
+// ── plot dragging ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Hold-to-lift, on the same press that would otherwise pan. The two gestures share a
+ * button, and the split is time: move within the hold and it was a pan all along, keep
+ * still and the plot under the pointer picks up. Everything mid-carry is cosmetic — a
+ * y-offset and a ghost of the footprint — and the real move is a single `movePlot` plus
+ * one roster pass on the drop, so a cancelled drag has nothing to unwind but visuals.
+ */
+const HOLD_MS = 250
+/** How high a carried zone floats. Enough to read as "picked up", not enough to occlude. */
+const LIFT_Y = 1.1
+/**
+ * The carried zone's colours, taken from the palette the rest of the colony already uses —
+ * `working` green and the soft red the HUD reds a thread with, rather than a saturated pair
+ * mixed for this one job. A drag is a normal thing to do and should not look like an alarm.
+ */
+const GHOST_VALID = 0x7fd39a
+const GHOST_INVALID = 0xe88b8b
+/** The rim is the same hue lifted toward white, so the tile has an edge without a second colour. */
+const GHOST_VALID_RIM = 0xcdf3de
+const GHOST_INVALID_RIM = 0xffcfcf
+
+const drag = {
+  timer: 0, // pending long-press
+  candidate: null, // repo name under the pressed pointer
+  startX: 0,
+  startY: 0,
+  lifted: false,
+  name: null,
+  cells: null, // the zone's footprint at lift, root first
+  grab: null, // which lattice cell the press landed on — the drag is relative to it
+  dq: 0,
+  dr: 0,
+  valid: true,
+  plan: null, // the layout a drop would apply, from planMove — null while the drop is illegal
+  swallowClick: false,
+  ghost: null, // { group, meshes, material, geometry }
+  pendingThreads: null, // a poll that landed mid-carry, applied on the drop
+}
+const dragGround = new THREE.Vector3()
+
+/**
+ * A rounded hexagon, flat in XZ and in phase with the lattice.
+ *
+ * Built as a `Shape` rather than a six-sided cylinder because the corners are the whole point:
+ * a hard hex prism reads as a selection box, and the colony is drawn in soft shapes everywhere
+ * else. Corners are quadratic arcs through the true vertex, which keeps the flat-to-flat width
+ * exactly `radius * √3` — the tile still lines up with its neighbours, it has just lost its
+ * points.
+ *
+ * Vertex angles match `CylinderGeometry(…, 6)` after `rotateY(π/6)`: measured from +Z toward +X,
+ * every 60° starting at 30°. `rotateX(-π/2)` flips the shape's y into −z, which for a hexagon at
+ * those angles is the same hexagon, so the phase survives the lay-down.
+ */
+function roundedHexGeometry(radius, round) {
+  const corner = (k) => {
+    const a = Math.PI / 6 + (k * Math.PI) / 3
+    return new THREE.Vector2(radius * Math.sin(a), radius * Math.cos(a))
+  }
+  const towards = (from, to, d) => from.clone().lerp(to, Math.min(d / from.distanceTo(to), 0.5))
+
+  const shape = new THREE.Shape()
+  for (let k = 0; k < 6; k++) {
+    const prev = corner((k + 5) % 6)
+    const here = corner(k)
+    const next = corner((k + 1) % 6)
+    const inbound = towards(here, prev, round)
+    const outbound = towards(here, next, round)
+    if (k === 0) shape.moveTo(inbound.x, inbound.y)
+    else shape.lineTo(inbound.x, inbound.y)
+    shape.quadraticCurveTo(here.x, here.y, outbound.x, outbound.y)
+  }
+  shape.closePath()
+
+  const geo = new THREE.ShapeGeometry(shape, 6)
+  geo.rotateX(-Math.PI / 2)
+  return geo
+}
+
+/**
+ * One tile per cell of the carried zone: a soft fill with a brighter rim sitting a hair above it.
+ *
+ * Two meshes rather than one because an unlit fill on its own has no edge, and over pale ground
+ * — sand, snow — a 30%-opacity wash simply disappears. The rim is what makes the footprint
+ * legible on every world, and it is the same geometry inset, so it costs one more draw and no
+ * new shape. Normal blending, not additive: additive over bright ground blows out to white and
+ * turns a routine drag into something that looks like an error state.
+ */
+function buildGhost(count) {
+  // Corner radius is a tenth of the tile, not a third: enough to take the points off so the
+  // footprint sits with the rest of the art, not so much that a hexagon reads as a circle.
+  // The rim is a line, not a border — 0.04 of a cell, about a third of a unit on the ground.
+  const geometry = roundedHexGeometry(PLOT_CELL * 0.94, PLOT_CELL * 0.1)
+  const inner = roundedHexGeometry(PLOT_CELL * 0.9, PLOT_CELL * 0.096)
+  const material = new THREE.MeshBasicMaterial({
+    color: GHOST_VALID,
+    transparent: true,
+    opacity: 0.38,
+    depthWrite: false,
+  })
+  const rim = new THREE.MeshBasicMaterial({
+    color: GHOST_VALID_RIM,
+    transparent: true,
+    opacity: 0.85,
+    depthWrite: false,
+  })
+  const group = new THREE.Group()
+  const meshes = []
+  for (let i = 0; i < count; i++) {
+    // The rim is the outer tile; the fill sits just inside it and just above, so the two never
+    // z-fight on a deck that is itself a flat plane.
+    const mesh = new THREE.Mesh(geometry, rim)
+    const fill = new THREE.Mesh(inner, material)
+    fill.position.y = 0.01
+    mesh.add(fill)
+    meshes.push(mesh)
+    group.add(mesh)
+  }
+  engine.scene.add(group)
+  drag.ghost = { group, meshes, material, rim, geometry, inner }
+}
+
+function placeGhost() {
+  const { meshes } = drag.ghost
+  drag.cells.forEach((c, i) => {
+    const { x, z } = hexToWorld(c.q + drag.dq, c.r + drag.dr)
+    // Just proud of the deck, which is itself proud of the roughest terrain.
+    meshes[i].position.set(x, DECK_TOP + 0.12, z)
+  })
+  drag.ghost.material.color.setHex(drag.valid ? GHOST_VALID : GHOST_INVALID)
+  drag.ghost.rim.color.setHex(drag.valid ? GHOST_VALID_RIM : GHOST_INVALID_RIM)
+}
+
+function disposeGhost() {
+  if (!drag.ghost) return
+  engine.scene.remove(drag.ghost.group)
+  drag.ghost.geometry.dispose()
+  drag.ghost.inner.dispose()
+  drag.ghost.material.dispose()
+  drag.ghost.rim.dispose()
+  drag.ghost = null
+}
+
+function cancelHold() {
+  clearTimeout(drag.timer)
+  drag.timer = 0
+  drag.candidate = null
+}
+
+function liftPlot() {
+  drag.timer = 0
+  const plot = colony.plots.get(drag.candidate)
+  drag.candidate = null
+  if (!plot) return // a poll rebuilt it out from under the hold — rare, and a lift of nothing
+  drag.lifted = true
+  drag.name = plot.name
+  drag.cells = plot.cells
+  // The drag is relative to the cell the press landed on, not to the zone's root: snapping
+  // the root under a cursor that grabbed the far corner would jump the zone half its own
+  // width on the first pixel of movement.
+  const g = rig.groundPoint(drag.startX, drag.startY, dragGround)
+  drag.grab = g ? worldToHex(g.x, g.z) : { ...plot.cells[0] }
+  drag.dq = 0
+  drag.dr = 0
+  drag.valid = true
+  // The pan gesture is already live under this press; `suppressed` is its escape hatch, and
+  // it self-clears on pointerup, so the rest of the press belongs to carrying the plot.
+  rig.suppressed = true
+  colony.setPlotLift(drag.name, LIFT_Y)
+  buildGhost(drag.cells.length)
+  placeGhost()
+  engine.canvas.style.cursor = 'grabbing'
+}
+
+/**
+ * Put the drag down, applying the move or not. Either way this ends in the standard
+ * "the map changed under the same roster" re-entry: `applyThreads` re-runs the roster pass,
+ * whose signature diff rebuilds the moved plot on its new ground, recomputes navigation and
+ * every crew site so the astronauts walk over rather than hammering at bare dirt, and whose
+ * layout diff writes the move to the colony file.
+ */
+function settleDrag(apply) {
+  colony.setPlotLift(drag.name, 0)
+  disposeGhost()
+  if (apply && drag.plan) colony.applyLayout(drag.plan)
+  const pending = drag.pendingThreads
+  drag.lifted = false
+  drag.pendingThreads = null
+  drag.name = null
+  drag.cells = null
+  drag.grab = null
+  drag.plan = null
+  if (apply || pending) applyThreads(pending || threads)
+  engine.canvas.style.cursor = 'grab'
+}
+
+engine.canvas.addEventListener('pointerdown', (e) => {
+  if (drag.timer) cancelHold()
+  if (drag.lifted) {
+    // A second finger mid-carry is the start of a pinch, not a drop: put the zone back.
+    settleDrag(false)
+    drag.swallowClick = true
+    return
+  }
+  // The camera reads these modifiers as "tilt and rotate" — that press is never a lift.
+  if (e.button !== 0 || e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return
+  const p = ndc(e)
+  if (colony.pick(p.x, p.y, p.aspect)) return // a press on an astronaut is a selection
+  const plot = plotUnder(e, p)
+  if (!plot) return
+  drag.candidate = plot.name
+  drag.startX = e.clientX
+  drag.startY = e.clientY
+  drag.timer = setTimeout(liftPlot, HOLD_MS)
+})
+
+// On window, like the camera's own listeners: a carry does not end at the canvas edge.
+window.addEventListener('pointermove', (e) => {
+  // The same 6px the camera's `wasClick` uses: past it this press was a pan all along.
+  if (drag.timer && Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) > 6) cancelHold()
+  if (!drag.lifted) return
+  if (!rig.groundPoint(e.clientX, e.clientY, dragGround)) return
+  const cell = worldToHex(dragGround.x, dragGround.z)
+  const dq = cell.q - drag.grab.q
+  const dr = cell.r - drag.grab.r
+  if (dq === drag.dq && dr === drag.dr) return
+  drag.dq = dq
+  drag.dr = dr
+  // The plan, not just a yes/no: a drop that strands a zone is allowed, and what comes back
+  // says where everything ends up. Kept so the drop applies exactly what the ghost was drawn
+  // against rather than recomputing against a layout a poll may have moved on.
+  drag.plan = planMove(colony.visibleLayout(), drag.name, dq, dr)
+  drag.valid = Boolean(drag.plan)
+  placeGhost()
+})
+
+window.addEventListener('pointerup', () => {
+  if (drag.timer) cancelHold()
+  if (drag.lifted) settleDrag(drag.valid && (drag.dq !== 0 || drag.dr !== 0))
+  // Cleared after the canvas's own pointerup has run — bubbling order is what lets the
+  // click handler still see it.
+  drag.swallowClick = false
+})
+
+window.addEventListener('pointercancel', () => {
+  if (drag.timer) cancelHold()
+  if (drag.lifted) settleDrag(false)
+})
+
 // Pressing on an astronaut used to suppress the camera, on the theory that grabbing one
 // should not also drag the world out from under it. But nothing is draggable *about* an
 // astronaut — a press is only ever the start of a selection or the start of a pan — so all
@@ -504,21 +861,22 @@ function plotUnder(e, p) {
 // on top of somebody. Selection is decided on release instead, where `wasClick` already
 // distinguishes a click from a drag.
 engine.canvas.addEventListener('pointerup', (e) => {
-  if (e.button !== 0 || !rig.wasClick) return
+  // A release that ends a lift is the end of a carry, not a click — even an unmoved one:
+  // long-pressing a plot and thinking better of it should not also open its sidebar.
+  if (e.button !== 0 || !rig.wasClick || drag.lifted || drag.swallowClick) return
   const p = ndc(e)
   const agent = colony.pick(p.x, p.y, p.aspect)
   if (agent) {
     select(agent.id, {})
     return
   }
-  // Nobody there: a zone's deck or its name plate opens that repo's sidebar instead, and
-  // bare ground puts everything down.
+  // Nobody there: whoever was selected is put down first, whatever else the click lands on
+  // — a deck of the same repo used to keep the card up. Then a zone's deck or its name plate
+  // opens that repo's sidebar, and bare ground closes that too.
+  if (selectedId) select(null, {})
   const plot = plotUnder(e, p)
   if (plot) selectProject(plot.name, {})
-  else {
-    select(null, {})
-    actions.closeProject()
-  }
+  else actions.closeProject()
 })
 
 engine.canvas.addEventListener('pointerleave', () => {
@@ -554,7 +912,7 @@ window.addEventListener('keydown', (e) => {
       break
     case 'n':
     case 'N':
-      actions.focusStatus('waiting')
+      actions.focusStatus(['waiting', 'approval', 'blocked'])
       break
     case 'p':
     case 'P':
@@ -567,6 +925,25 @@ window.addEventListener('keydown', (e) => {
     case 'o':
     case 'O':
       hud.setOrbit(actions.toggleOrbit())
+      break
+    case 'm':
+    case 'M':
+      settings.set('sound', !settings.get('sound'))
+      hud.hint(settings.get('sound') ? 'Sound on' : 'Muted')
+      break
+    // Plain jumps within the open zone; shift jumps the whole colony — one binding, the
+    // modifier is what decides scope, so there is nothing else to keep in sync.
+    case 'j':
+    case 'J':
+      actions.focusAgent({ crossProject: e.shiftKey })
+      break
+    case 'k':
+    case 'K':
+      actions.cycleProject()
+      break
+    case 'b':
+    case 'B':
+      actions.focusBusiest()
       break
     case 'Tab':
       e.preventDefault()
@@ -619,10 +996,17 @@ window.addEventListener('keydown', (e) => {
     case '_':
       rig.desiredDistance = Math.min(150, rig.desiredDistance * 1.22)
       break
-    // One step at a time, outward: the thread, then the zone it belongs to.
+    // One step at a time, outward: the drag in hand, the thread, then the zone.
     case 'Escape':
       if (hud.closeHarnessMenu?.()) break
-      if (document.querySelector('.help.open')) hud.toggleHelp(false)
+      if (drag.lifted || drag.timer) {
+        cancelHold()
+        if (drag.lifted) {
+          settleDrag(false)
+          // The pointer is still down; the release that follows ends a dead gesture.
+          drag.swallowClick = true
+        }
+      } else if (document.querySelector('.help.open')) hud.toggleHelp(false)
       else if (selectedId) select(null, {})
       else if (selectedProject) actions.closeProject()
       break
@@ -632,6 +1016,16 @@ window.addEventListener('keydown', (e) => {
 // ── data ──────────────────────────────────────────────────────────────────────────────
 
 function applyThreads(list) {
+  // Parked while a plot is in hand. `allocateCells` would leave the carried zone's cells
+  // alone, but a sibling that grew a thread still rebuilds — and any rebuild pass disposes
+  // whichever plots changed, which mid-carry means the lifted group can be torn down under
+  // the drag's own hands. Polls are 15s apart and a drag is seconds; the scan waits.
+  if (drag.lifted) {
+    drag.pendingThreads = list
+    return
+  }
+  list = withErrands(list)
+
   // A thread you have said you looked at stops counting as unread until it moves on again.
   // Done here rather than in `statusFor` so the card, the badge and the astronaut all agree.
   const viewed = state.viewedAt || {}
@@ -658,6 +1052,12 @@ function applyThreads(list) {
 
   const stats = colony.setThreads(list, archivedSet, hiddenSet, known)
   hud.setStats(stats)
+  chimeForNewWaiting(list, archivedSet, hiddenSet)
+
+  // Every call the harness reported since the last poll fires one switchboard beam at the
+  // zone it happened in. The harness already trims this to what is new — nothing here has
+  // to remember what it showed last time.
+  for (const t of list) for (const call of t.mcpCalls || []) colony.pulseMcpCall(call.project || t.project)
 
   legendProjects = colony.plotOrder
     .map((plot) => ({
@@ -688,6 +1088,35 @@ function applyThreads(list) {
   }
 }
 
+/**
+ * The one sound that is allowed to interrupt: a thread that has just put its hand up. Once
+ * per thread per wait, never on the first roster (a reload is not news), and never more
+ * than one chime a couple of seconds apart however many arrive at once.
+ */
+const waitingBefore = new Set()
+let seenFirstRoster = false
+let lastChime = 0
+function chimeForNewWaiting(list, archivedSet, hiddenSet) {
+  const now = Date.now()
+  const waiting = new Set()
+  for (const t of list) {
+    if (archivedSet.has(t.id) || hiddenSet.has(t.project)) continue
+    const status = statusFor(t, now)
+    if (status === 'waiting' || status === 'approval') waiting.add(t.id)
+  }
+  if (seenFirstRoster) {
+    for (const id of waiting) {
+      if (waitingBefore.has(id) || now - lastChime < 2500) continue
+      lastChime = now
+      const agent = colony.agentFor(id)
+      ambience.play('chime-attention', agent ? { x: agent.pos.x, y: agent.pos.y + 1, z: agent.pos.z, gain: 0.9 } : { gain: 0.9 })
+    }
+  }
+  seenFirstRoster = true
+  waitingBefore.clear()
+  for (const id of waiting) waitingBefore.add(id)
+}
+
 let polling = false
 async function poll() {
   if (polling) return
@@ -701,6 +1130,18 @@ async function poll() {
     hud.removeBoot()
   } finally {
     polling = false
+  }
+
+  // Usage rides its own try/catch: a harness with no cost model to offer, or a scan that
+  // failed for some other reason, should never take the thread poll above down with it.
+  try {
+    const usage = await fetchUsage()
+    lastSpend = usage.spendThisMonth || 0
+    colony.setUsage(lastSpend)
+    hud.setUsage(lastSpend, settings.get('monthlyBudget'))
+    for (const delta of usage.deltas || []) colony.pulseSpend(delta.id, delta.usd)
+  } catch {
+    /* the canister just holds its last known reading */
   }
 }
 
@@ -735,7 +1176,11 @@ async function boot() {
         if (!hasStoredSettings() && state.settings) settings.applyAll(state.settings)
       })
       .catch(() => {
-        /* first run, or the file is gone — an empty colony state is a valid one */
+        // Not "first run, or the file is gone": the server answers a missing file with an empty
+        // state rather than an error, so a rejection means it could not be reached and we do not
+        // know what is on disk. Saves stay off for this session and say so, because an archive
+        // that silently fails to persist is worse than one that refuses.
+        hud.toast('Could not read the saved colony — archiving is off until you reload', 'err')
       }),
     settle(loadKit()),
     settle(loadCrew()),
@@ -759,7 +1204,7 @@ async function boot() {
     hud.toggleHelp(true)
     localStorage.setItem('botcrossing.seen-help', '1')
   } else {
-    hud.hint('Drag to move · click an astronaut · H hides everything', 5200)
+    hud.hint('Drag to move · click a bot · H hides everything', 5200)
   }
 }
 
@@ -772,19 +1217,29 @@ settings.onChange((changed, scope) => {
   state.settings = { ...settings.values }
   queueSave()
   if (scope.render || changed.has('fov')) engine.applySettings()
+  if (changed.has('planet')) engine.setPlanetGrade(PLANETS[settings.get('planet')]?.grade)
   colony.onSettingsChanged(changed, scope)
+  if (changed.has('planet')) ambience.setPlanet(colony.planet)
   if (changed.has('showFps')) hud.syncSettings()
+  if (changed.has('followSelected')) rig.setFollow(settings.get('followSelected') ? colony.agentFor(selectedId) : null)
   // Folding dormant repos away changes which threads are on the map, so the colony has to be
   // rebuilt from the list rather than merely re-rendered.
   if (changed.has('hideDormant')) applyThreads(threads)
   if (changed.has('maxAgents')) applyThreads(threads)
+  // The canister recolours itself on a budget change without waiting on the next poll; the
+  // readout is plain text with no such wiring of its own, so it needs telling directly.
+  if (changed.has('monthlyBudget')) hud.setUsage(lastSpend, settings.get('monthlyBudget'))
 })
 
 // ── frame ─────────────────────────────────────────────────────────────────────────────
 
 engine.add({
   update(dt, elapsed) {
+    rig.setFollow(settings.get('followSelected') ? colony.agentFor(selectedId) : null)
     rig.update(dt)
+    // The world bends away from wherever the camera is looking, every frame, before the
+    // colony projects anything to the screen.
+    setCurveView(rig.target, rig.azimuth, settings.get('worldCurve') * CURVE_FULL)
     colony.update(dt, elapsed, rig.target)
     // Whatever the camera is orbiting is what should be in focus.
     engine.setFocusDistance(rig.distance)
@@ -797,14 +1252,65 @@ engine.add({
       else hud.placeCard(screenOf(agent))
     }
     hud.setFps(engine.perf, engine.viewport, `${colony.astronauts.visibleCount} crew · ${colony.particles.liveCount} bits`)
+    ambience.update(dt, engine.camera, soundWorld())
   },
 })
+
+// ── what the world sounds like ────────────────────────────────────────────────────────
+
+const soundSources = []
+const soundWater = { level: 0, points: [] }
+const shipSpot = shipPosition()
+/**
+ * Everything making a noise right now, as positional sources. Objects are reused between
+ * frames so the audio engine can key voices by id without anything being allocated.
+ */
+function soundWorld() {
+  let n = 0
+  const take = (id, sound, x, y, z, gain = 1) => {
+    const s = soundSources[n] || (soundSources[n] = { id: '', sound: '', x: 0, y: 0, z: 0, gain: 1 })
+    s.id = id
+    s.sound = sound
+    s.x = x
+    s.y = y
+    s.z = z
+    s.gain = gain
+    n++
+  }
+  for (const agent of colony.astronauts.agents) {
+    if (agent.state === 'at-site' && agent.status === 'working' && agent.scale > 0.5) {
+      take(`work:${agent.id}`, 'work-hammer', agent.pos.x, agent.pos.y + 0.6, agent.pos.z, 0.9)
+    }
+  }
+  take('ship', 'ship-hum', shipSpot.x, colony.ship.group.position.y + 3, shipSpot.z, 0.7)
+  colony.fauna.drones.forEach((d, i) => take(`drone:${i}`, 'drone-whine', d.x, d.y, d.z, d.busy ? 1 : 0.35))
+  soundSources.length = n
+
+  let water = null
+  if (colony.planet.water && colony.planet.audio?.shore) {
+    // The half-dozen bits of shoreline nearest the view: the whole coast is hundreds of
+    // points, and the engine only has ten voices to give out.
+    const all = shorelinePoints(colony.planet)
+    const t = rig.target
+    soundWater.points = all
+      .map((p) => ({ p, d: (p.x - t.x) * (p.x - t.x) + (p.z - t.z) * (p.z - t.z) }))
+      .sort((a, b) => a.d - b.d)
+      .slice(0, 6)
+      .map((e) => e.p)
+    soundWater.level = colony.planet.water.level
+    // Where the view is, so the surf beds can be quieter the further inland it sits.
+    soundWater.focusX = t.x
+    soundWater.focusZ = t.z
+    water = soundWater
+  }
+  return { night: colony.sky.nightFactor ?? 0, sources: soundSources, water }
+}
 
 engine.start()
 boot()
 
 // Handy for poking at the running colony from the console.
-window.botCrossing = { engine, rig, colony, settings, hud, poll, get threads() { return threads } }
+window.botCrossing = { engine, rig, colony, settings, hud, ambience, poll, get threads() { return threads } }
 
 /** `execCommand('copy')` over a throwaway textarea — the copy that predates permissions. */
 function copyFallback(text) {

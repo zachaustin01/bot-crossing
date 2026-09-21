@@ -1,10 +1,21 @@
+import { SceneryReflections } from '../world/reflections.js'
 import * as THREE from 'three'
 import { PLANETS, createTerrain, createScatter, terrainHeight } from '../world/planet.js'
+import { createWater } from '../world/water.js'
+import { Fauna } from '../world/fauna.js'
+import { BuildingSurfaces } from '../world/building-surfaces.js'
+import { createGrass } from '../world/grass.js'
+import { createSkyIsland } from '../world/skyisland.js'
+import { SKY_MARGIN, SKY_MAX_CELLS, setIslandFootprint } from '../world/planet.js'
+import { createHexIsland } from '../world/hexisland.js'
+import { bendPoint } from '../core/curve.js'
 import { Sky } from '../world/sky.js'
 import {
   Plot,
   allocateCells,
   shipPosition,
+  switchboardPosition,
+  canisterPosition,
   createLabel,
   hashString,
   worldToHex,
@@ -12,8 +23,12 @@ import {
   PLOT_PALETTE,
   PLOT_CELL,
 } from '../world/plots.js'
+import { translateCells } from '../world/plot-move.js'
 import { createBuilding, buildingUniforms, Scaffolds } from '../world/buildings.js'
 import { Ship } from '../world/ship.js'
+import { MCPSwitchboard } from '../world/mcpSwitchboard.js'
+import { UsageCanister, burnRatio } from '../world/usageCanister.js'
+import { UsageBursts } from '../world/usageBursts.js'
 import { Astronauts } from '../agents/astronauts.js'
 import { Indicators, BADGE } from '../agents/indicators.js'
 import { MAX_AGENT_CAP } from '../core/settings.js'
@@ -41,19 +56,29 @@ import { liveThreadsForColony } from './hidden-projects.js'
  */
 
 const STALE_MS = 3 * 24 * 60 * 60 * 1000
+/** How long a plot's border flashes after an MCP call — matches the switchboard beam's own
+ *  fade, so the two ends of the connection read as one event rather than two. */
+const MCP_PULSE_LIFETIME = 2.6
 /** How wide an astronaut is, for the purpose of not fitting through gaps it should not. */
 const AGENT_RADIUS = 0.26
+/**
+ * The radius the crew *travels* with, which is smaller than the one it stands with. The
+ * grid is rasterised at this, so the gaps between buildings stay routes; a shoulder
+ * through a wall for a step is the price, and the keep radius sorts it out on arrival.
+ */
+const TRAVEL_RADIUS = 0.12
 /** Progress a live thread adds per second, so a working site visibly grows while you watch. */
 const LIVE_GROWTH = 0.004
 /** How many zones' positions to remember, including repos with nothing running in them. */
 const LAYOUT_MEMORY = 80
 
-export const STATUS_ORDER = ['blocked', 'waiting', 'working', 'celebrating', 'idle', 'sleeping']
+export const STATUS_ORDER = ['blocked', 'approval', 'waiting', 'working', 'celebrating', 'idle', 'sleeping']
 
 export const STATUS_LABEL = {
   working: 'Working',
   waiting: 'Waiting on you',
   blocked: 'Blocked',
+  approval: 'Needs approval',
   celebrating: 'Shipped',
   idle: 'Idle',
   sleeping: 'Dormant',
@@ -64,6 +89,9 @@ export const STATUS_LABEL = {
 /** Thread → behaviour. First match wins, exactly like the board's auto-sort. */
 export function statusFor(thread, now = Date.now()) {
   if (thread.hasError) return 'blocked'
+  // Sitting at a permission prompt outranks "working": the process is alive, but it has
+  // stopped and it wants you specifically, same as a thread that handed the turn back.
+  if (thread.blocked) return 'approval'
   if (thread.running) return 'working'
   if (thread.prState === 'MERGED') return 'celebrating'
   if (thread.unread) return 'waiting'
@@ -79,6 +107,7 @@ export function statusFor(thread, now = Date.now()) {
 const BADGE_FOR = {
   waiting: BADGE.waiting,
   blocked: BADGE.blocked,
+  approval: BADGE.approval,
   working: BADGE.working,
   celebrating: BADGE.done,
   sleeping: BADGE.none,
@@ -113,6 +142,7 @@ export class Colony {
     this.renderer = renderer
 
     this.planet = PLANETS[settings.get('planet')] || PLANETS.moon
+    this._applyPlanetTint()
     this.sky = new Sky(scene, settings, renderer)
     this.sky.setPlanet(this.planet)
     // Push the stored time in explicitly. `settings.set` is a no-op when the value has not
@@ -129,14 +159,25 @@ export class Colony {
      */
     this.plotCells = new Map()
     this.buildings = new Map()
+    this.buildingSurfaces = new BuildingSurfaces(this.buildings, (x, z) => this.surfaceAt(x, z))
     this.threads = new Map()
     this.usedAccents = new Set()
+    /** Project id -> seconds left of border flash, decaying to 0. See `pulseMcpCall`. */
+    this.mcpPulses = new Map()
 
     this.worldGroup = new THREE.Group()
     this.worldGroup.name = 'world'
     scene.add(this.worldGroup)
 
     this.ship = new Ship(scene, shipPosition())
+    this.switchboard = new MCPSwitchboard(scene, switchboardPosition())
+    this.switchboard.group.visible = settings.get('mcpSwitchboard')
+    this.usageCanister = new UsageCanister(scene, canisterPosition())
+    this.usageCanister.group.visible = settings.get('usageCanister')
+    this.usageBursts = new UsageBursts(scene)
+    /** Last spend total this colony was told about, so a budget change alone can recolour
+     *  the canister without waiting on the next poll's usage figure. */
+    this._lastSpend = 0
     this.astronauts = new Astronauts(scene, settings)
     this.astronauts.world = this._world()
     // Sized for the largest preset rather than the current one: unlike the astronaut meshes these
@@ -146,6 +187,15 @@ export class Colony {
     this.indicators = new Indicators(scene, settings, MAX_AGENT_CAP)
     this.particles = new Particles(scene, settings)
     this.scaffolds = new Scaffolds(scene, 320)
+    // Birds, butterflies, fish and the cargo drones: the life that carries no information.
+    this.fauna = new Fauna(scene, settings)
+    this.reflections = new SceneryReflections({
+      scene, renderer, settings, sky: this.sky, astronauts: this.astronauts,
+      excluded: () => [this.labelGroup, this.indicators.mesh, this.particles.points,
+        this.fauna.group, this.grass?.mesh],
+    })
+    /** Set by whoever owns the speakers: (name, x, y, z) for a sound the world just made. */
+    this.onSound = null
     this.nav = new Navigation()
     this.astronauts.setNavigation(this.nav)
 
@@ -160,6 +210,7 @@ export class Colony {
     this.activePlots = new Set()
     this._dustTint = new THREE.Color(this.planet.ground.high)
     this._c = new THREE.Color()
+    this._c2 = new THREE.Color()
     this.stats = { agents: 0, projects: 0, working: 0, waiting: 0, blocked: 0, done: 0 }
 
     this._buildTerrain()
@@ -178,8 +229,12 @@ export class Colony {
       disposeTree(this.scatterGroup)
     }
 
+    // An island world is shaped around the colony: the coast has to know the cells first.
+    if (this.planet.shape === 'island') setIslandFootprint(this._footprintCells(), PLOT_CELL)
     this.terrain = createTerrain(this.planet, this.settings.get('groundDetail'))
     this.worldGroup.add(this.terrain)
+    this._buildIsland()
+    this._buildWater()
     this._buildScatter()
 
     // The ship has legs, and legs have to reach the ground. Its landing spot is a fixed hex
@@ -187,8 +242,157 @@ export class Colony {
     // at construction — a world with more relief would otherwise leave it hovering.
     const ship = shipPosition()
     this.ship.group.position.y = terrainHeight(ship.x, ship.z, this.planet)
+    const switchboard = switchboardPosition()
+    this.switchboard.group.position.y = terrainHeight(switchboard.x, switchboard.z, this.planet)
+    const canister = canisterPosition()
+    this.usageCanister.group.position.y = terrainHeight(canister.x, canister.z, this.planet)
 
     this._dustTint.set(this.planet.ground.high)
+
+    // Only when the world itself changed. The terrain is rebuilt for a scatter or detail
+    // setting too, and re-seeding the wildlife for that puts every flock back at its spawn
+    // point in the middle of the map — a quality toggle should not restart the birds.
+    if (this._faunaPlanet !== this.planet.id) {
+      this._faunaPlanet = this.planet.id
+      this.fauna.setPlanet(this.planet, {
+        heightAt: (x, z) => this.groundAt(x, z),
+        parcelSurfaceAt: (x, z) => this.buildingSurfaces.at(x, z),
+        waterLevel: this.planet.water?.level ?? null,
+        waterHeightAt: this.water ? (x, z, t) => this.water.heightAt(x, z, t) : undefined,
+      })
+    }
+    this._syncFaunaSites()
+  }
+
+  /** Where the drones fly between: the lander, and every building with anyone at it. */
+  _syncFaunaSites() {
+    const sites = []
+    for (const [id, entry] of this.buildings) {
+      if (entry.retiring) continue
+      const p = entry.mesh.position
+      sites.push({ x: p.x, y: p.y, z: p.z, radius: entry.mesh.userData.footprint, active: this._isActive(id) })
+    }
+    const pad = shipPosition()
+    pad.y = this.ship.group.position.y
+    this.fauna.setSites({ ship: this.ship.shipDoor(), pad, sites })
+  }
+
+  /**
+   * What holds a floating island up: nothing. What it needs instead is an underside — rock
+   * and roots and vines hanging off the rim — and a sea of cloud far below it.
+   */
+  _buildIsland() {
+    if (this.island) {
+      this.worldGroup.remove(this.island.group)
+      this.island.dispose()
+      this.island = null
+    }
+    if (this.rock) {
+      this.rock.dispose()
+      this.rock = null
+    }
+    if (this.planet.shape !== 'sky') return
+    const detail = this.settings.get('groundDetail')
+    // The cloud sea and the drifting puffs come from here; the round underside it also
+    // builds is switched off, because this island is not round — see `_syncIslandRock`.
+    this.island = createSkyIsland({
+      planet: this.planet,
+      heightAt: (x, z) => terrainHeight(x, z, this.planet),
+      rimRadius: this._footprintRadius() + 6,
+      quality: detail === 'high' ? 'high' : detail === 'low' ? 'low' : 'medium',
+    })
+    this.island.meshes.underside.visible = false
+    this.island.meshes.vines.visible = false
+    this.island.setDaylight(this.sky.dayFactor ?? 1)
+    this.worldGroup.add(this.island.group)
+    this._syncIslandRock()
+  }
+
+  /** Every hex cell the colony holds, plus the ship's, in world space. */
+  _footprintCells() {
+    const list = []
+    for (const plot of this.plotOrder) {
+      for (const local of plot.localCenters) list.push({ x: plot.center.x + local.x, z: plot.center.z + local.z })
+    }
+    const ship = shipPosition()
+    list.push({ x: ship.x, z: ship.z })
+    const switchboard = switchboardPosition()
+    list.push({ x: switchboard.x, z: switchboard.z })
+    const canister = canisterPosition()
+    list.push({ x: canister.x, z: canister.z })
+    return list.slice(0, SKY_MAX_CELLS)
+  }
+
+  _footprintRadius() {
+    let r = PLOT_CELL
+    for (const c of this._footprintCells()) r = Math.max(r, Math.hypot(c.x, c.z) + PLOT_CELL)
+    return r
+  }
+
+  /**
+   * Whether a point is on the island: within a cell and its grass margin. The terrain's edge
+   * frays a little inside the margin, so this stays a touch conservative to keep grass and
+   * scatter off the frayed-away bits.
+   */
+  onIsland(x, z) {
+    if (this.planet.shape !== 'sky') return true
+    const reach = (PLOT_CELL + SKY_MARGIN) * 0.86
+    for (const c of this._footprintCells()) {
+      const dx = x - c.x
+      const dz = z - c.z
+      if (dx * dx + dz * dz < reach * reach) return true
+    }
+    return false
+  }
+
+  /**
+   * The rock under the plots, rebuilt whenever the plots change: a jagged plug per cell,
+   * so the island is exactly the colony's shape and grows and shrinks with it.
+   */
+  _syncIslandRock() {
+    if (this.planet.shape !== 'sky') return
+    if (this.rock) {
+      this.rock.dispose()
+      this.rock = null
+    }
+    const cells = this._footprintCells()
+    this.terrain.userData.setFootprint?.(cells, PLOT_CELL + SKY_MARGIN)
+    const detail = this.settings.get('groundDetail')
+    const p = this.planet.skyIsland || {}
+    this.rock = createHexIsland({
+      cells,
+      cellRadius: PLOT_CELL,
+      margin: SKY_MARGIN,
+      palette: { soil: p.soil, rock: p.rock, vine: p.vine, moss: this.planet.ground.low },
+      quality: detail === 'low' ? 'low' : 'medium',
+    })
+    this.worldGroup.add(this.rock.group)
+  }
+
+  /**
+   * The sea, the lakes, or the lava — whatever this world has that is not ground. One plane
+   * at the planet's water level; where the terrain is lower, there is water.
+   */
+  _buildWater() {
+    if (this.water) {
+      this.worldGroup.remove(this.water.mesh)
+      this.water.dispose()
+      this.water = null
+    }
+    const detail = this.settings.get('groundDetail')
+    this.water = createWater({
+      planet: this.planet,
+      heightAt: (x, z) => terrainHeight(x, z, this.planet),
+      quality: detail === 'high' ? 'high' : detail === 'low' ? 'low' : 'medium',
+    })
+    if (this.water) this.worldGroup.add(this.water.mesh)
+  }
+
+  /** A ring on the water at a point, if there is water there. Safe to call anywhere. */
+  ripple(x, z, strength = 1) {
+    if (!this.water) return
+    if (terrainHeight(x, z, this.planet) >= this.planet.water.level) return
+    this.water.ripple(x, z, strength)
   }
 
   /**
@@ -213,11 +417,39 @@ export class Colony {
     }
     const ship = shipPosition()
     clear.push({ x: ship.x, z: ship.z, r: 7.5 })
-    this.scatterGroup = createScatter(this.planet, this.settings.get('scatterDensity'), clear)
+    const switchboard = switchboardPosition()
+    clear.push({ x: switchboard.x, z: switchboard.z, r: 6 })
+    const canister = canisterPosition()
+    clear.push({ x: canister.x, z: canister.z, r: 6 })
+    this.scatterGroup = createScatter(this.planet, this.settings.get('scatterDensity'), clear, 4242, (x, z) => this.onIsland(x, z))
     this.worldGroup.add(this.scatterGroup)
     this._scatterFootprint = this._plotFootprint()
+    this._buildGrass(clear)
     // The crew routes around scatter, so a new scatter is a new navigation grid.
     if (this.nav) this._rebuildNavigation()
+  }
+
+  /**
+   * The meadow, on worlds that have one. Kept clear of the same ground the scatter is, and
+   * rebuilt with it: a plot laid over grass would have blades poking up through the deck.
+   */
+  _buildGrass(clear) {
+    const apron = clear[clear.length - 1]
+    if (this.grass) {
+      this.grass.dispose()
+      this.grass = null
+    }
+    const detail = this.settings.get('groundDetail')
+    this.grass = createGrass({
+      planet: this.planet,
+      heightAt: (x, z) => terrainHeight(x, z, this.planet),
+      blocked: (x, z) => !this.onIsland(x, z) ||
+        this.plotOrder.some((plot) => plot.containsWorld(x, z, -0.4)) ||
+        (apron && (x - apron.x) ** 2 + (z - apron.z) ** 2 < apron.r * apron.r),
+      density: this.settings.get('scatterDensity'),
+      quality: detail === 'high' ? 'high' : detail === 'low' ? 'low' : 'medium',
+    })
+    if (this.grass) this.worldGroup.add(this.grass.mesh)
   }
 
   /** What the scatter has to avoid, as one string — cheap to compare every poll. */
@@ -241,8 +473,20 @@ export class Colony {
     const planet = PLANETS[id]
     if (!planet || planet === this.planet) return
     this.planet = planet
+    this.reflections.invalidate()
+    this._applyPlanetTint()
     this.sky.setPlanet(planet)
     this._buildTerrain()
+  }
+
+  /**
+   * The buildings' shared planet-tint uniforms. Shared is the point: every standing
+   * building re-themes on a planet switch without a single rebuild.
+   */
+  _applyPlanetTint() {
+    const tint = this.planet.buildingTint
+    buildingUniforms.uPlanetTint.value.set(tint ?? 0xffffff)
+    buildingUniforms.uPlanetTintAmount.value = tint != null ? 1 : 0
   }
 
   onSettingsChanged(changed, scope) {
@@ -252,8 +496,26 @@ export class Colony {
     this.sky.onSettingsChanged(changed)
     this.astronauts.onSettingsChanged(changed)
     this.particles.onSettingsChanged(changed)
+    this.fauna.onSettingsChanged(changed)
+    if (changed.has('clouds')) this.sky.setPlanet(this.planet)
     if (changed.has('showLabels')) this._syncLabels()
     if (changed.has('timeOfDay')) this.sky.setTime(this.settings.get('timeOfDay'))
+    if (changed.has('mcpSwitchboard')) {
+      const on = this.settings.get('mcpSwitchboard')
+      this.switchboard.group.visible = on
+      if (!on) {
+        this.switchboard.clear()
+        this.mcpPulses.clear()
+      }
+    }
+    if (changed.has('usageCanister')) {
+      const on = this.settings.get('usageCanister')
+      this.usageCanister.group.visible = on
+      if (!on) this.usageBursts.clear()
+    }
+    // A budget change alone should recolour and refill the canister without waiting on the
+    // next poll's usage figure — the number it is drawn against just moved.
+    if (changed.has('monthlyBudget')) this._applyUsage(this._lastSpend)
   }
 
   // ── roster ──────────────────────────────────────────────────────────────────────────
@@ -330,14 +592,29 @@ export class Colony {
     for (const [name, list] of projects) {
       const plot = this.plots.get(name)
       if (!plot) continue
-      // Oldest thread first, so a given session keeps its slot as siblings come and go.
+      // Oldest thread first, so the *first* assignment of slots is deterministic; after that a
+      // thread keeps the slot it was given for as long as the plot stands. Numbering by
+      // position in this list, which is what this used to do, meant one archive shifted every
+      // younger sibling one slot along — every building on the plot moved and every
+      // astronaut walked, for a thread that had left.
       list.sort((a, b) => a.createdAt - b.createdAt)
+      const slotOf = plot.slotOf || (plot.slotOf = new Map())
+      for (const id of [...slotOf.keys()]) if (!list.some((t) => t.id === id)) slotOf.delete(id)
+      const taken = new Set(slotOf.values())
+      for (const thread of list) {
+        if (slotOf.has(thread.id)) continue
+        let slot = 0
+        while (taken.has(slot)) slot++
+        taken.add(slot)
+        slotOf.set(thread.id, slot)
+      }
 
-      list.forEach((thread, i) => {
+      list.forEach((thread) => {
+        const i = slotOf.get(thread.id)
         const status = statusFor(thread, now)
         if (stats[status] !== undefined) stats[status]++
-        if (status === 'waiting' || status === 'blocked') urgent.add(plot.id)
-        if (status === 'waiting' || status === 'blocked' || status === 'working') active.add(plot.id)
+        if (status === 'waiting' || status === 'blocked' || status === 'approval') urgent.add(plot.id)
+        if (status === 'waiting' || status === 'blocked' || status === 'approval' || status === 'working') active.add(plot.id)
         stats.agents++
 
         const building = this._syncBuilding(thread, plot, i)
@@ -347,7 +624,7 @@ export class Colony {
           id: thread.id,
           thread,
           status,
-          site: this._workSite(plot, building, i),
+          site: null, // assigned after all buildings have reached the navigation map
           // Where the work actually is. A working astronaut circles it rather than standing
           // at one spot, so it needs the building, not just a place to stand near it.
           anchor: building.mesh.position.clone(),
@@ -367,6 +644,11 @@ export class Colony {
     this.urgentPlots = urgent
     this.activePlots = active
     this._rebuildNavigation()
+    for (const member of roster) {
+      const entry = this.buildings.get(member.id)
+      member.site = this._workSite(this.plots.get(entry.plot), entry, entry.slot)
+    }
+    this._syncFaunaSites()
     this.stats = { ...stats, done: stats.celebrating }
     this.astronauts.setRoster(roster, this._world())
     return this.stats
@@ -422,8 +704,16 @@ export class Colony {
     })
 
     this.plotOrder = [...this.plots.values()]
-    // Zones that just moved, appeared or grew are zones the scatter does not know about.
-    if (this.scatterGroup && this._plotFootprint() !== this._scatterFootprint) this._buildScatter()
+    // Zones that just moved, appeared or grew are zones the scatter does not know about —
+    // nor, on a floating island, the rock under them; and on an island in the sea, the
+    // coast itself moves, which is the whole terrain.
+    if (this.scatterGroup && this._plotFootprint() !== this._scatterFootprint) {
+      if (this.planet.shape === 'island') this._buildTerrain()
+      else {
+        this._buildScatter()
+        if (this.island) this._syncIslandRock()
+      }
+    }
     // Which hex cells are decked. Ground height is asked for once per moving agent per
     // frame, so it wants to be a lookup rather than a scan over every plot's every tile.
     this.deckedCells = new Set()
@@ -445,6 +735,7 @@ export class Colony {
   _world() {
     return {
       shipDoor: () => this.ship.shipDoor(),
+      shipAirlock: () => this.ship.shipAirlock(),
       groundAt: (x, z) => this.groundAt(x, z),
     }
   }
@@ -453,6 +744,13 @@ export class Colony {
     const cell = worldToHex(x, z)
     if (this.deckedCells?.has(`${cell.q},${cell.r}`)) return DECK_TOP
     return terrainHeight(x, z, this.planet)
+  }
+
+  /** The surface anything floating or falling meets: the water where there is water, else the ground. */
+  surfaceAt(x, z) {
+    const ground = this.groundAt(x, z)
+    const level = this.planet.water?.level
+    return level !== undefined && ground < level ? level : ground
   }
 
   /** A stable colour per repo, probing forward on a collision so no two plots match. */
@@ -529,14 +827,17 @@ export class Colony {
     for (const entry of this.buildings.values()) {
       if (entry.retiring) continue
       const p = entry.mesh.position
-      const r = (entry.mesh.userData.footprint || 1.2) * 0.8 + AGENT_RADIUS
-      obstacles.push({ x: p.x, z: p.z, r })
+      const footprint = entry.mesh.userData.footprint || 1.2
+      const r = footprint * 0.8 + TRAVEL_RADIUS
+      // The grid blocks less than the whole footprint so the gaps stay walkable; the
+      // keep radius is where the crew is actually held to — see `Navigation.repel`.
+      obstacles.push({ x: p.x, z: p.z, r, keep: footprint * 0.92 + AGENT_RADIUS })
     }
     // Ground clutter counts too. A crate is only knee-high, but an astronaut walking
     // straight through one is exactly as wrong as one walking through a habitat.
     for (const plot of this.plotOrder) {
       for (const spot of plot.clutterSpots || []) {
-        obstacles.push({ x: plot.center.x + spot.x, z: plot.center.z + spot.z, r: spot.r + AGENT_RADIUS })
+        obstacles.push({ x: plot.center.x + spot.x, z: plot.center.z + spot.z, r: spot.r + TRAVEL_RADIUS, keep: spot.r + AGENT_RADIUS + 0.1 })
       }
     }
     // Ground scatter counts as well. A boulder an astronaut can walk through is the same
@@ -557,7 +858,21 @@ export class Colony {
         // sprig fences the corridors between zones — the crew walks the gaps between plots
         // to get anywhere, and scatter is placed in exactly those gaps.
         if (r < 0.55) continue
-        obstacles.push({ x: mat.elements[12], z: mat.elements[14], r: r + AGENT_RADIUS })
+        // Held to as well as routed round: a shoulder through a boulder is the same glitch
+        // as one through a wall, just smaller.
+        obstacles.push({ x: mat.elements[12], z: mat.elements[14], r: r + TRAVEL_RADIUS, keep: r + AGENT_RADIUS + 0.1 })
+      }
+    }
+
+    // Scaffold poles. They stand just outside the building's own keep radius, exactly
+    // where its builder stands, so without these the builder works with a pole through it.
+    for (const site of this._scaffoldSites(true)) {
+      for (let i = 0; i < 4; i++) {
+        const a = (i / 4) * Math.PI * 2 + 0.78
+        const x = site.x + Math.cos(a) * site.radius
+        const z = site.z + Math.sin(a) * site.radius
+        if (site.contains && !site.contains(x, z)) continue
+        obstacles.push({ x, z, r: 0.14 + TRAVEL_RADIUS, keep: 0.14 + AGENT_RADIUS + 0.12 })
       }
     }
 
@@ -603,7 +918,8 @@ export class Colony {
     for (const plot of this.plotOrder) {
       const label = plot.label
       if (!label) continue
-      const dist = -view.copy(label.position).applyMatrix4(this.camera.matrixWorldInverse).z
+      // Bent like the shader bends the anchor, so a far plate is hit where it is drawn.
+      const dist = -bendPoint(view.copy(label.position)).applyMatrix4(this.camera.matrixWorldInverse).z
       if (dist <= 0.01 || dist >= bestDist) continue
       const geo = label.geometry.parameters
       const k = 0.55 + dist * 0.03
@@ -648,6 +964,68 @@ export class Colony {
     this.hoveredPlot = plot || null
   }
 
+  /** The zones actually on the map, name → cells — what a drag validates against. */
+  visibleLayout() {
+    const out = new Map()
+    for (const [name, plot] of this.plots) out.set(name, plot.cells)
+    return out
+  }
+
+  /**
+   * Translate one zone's remembered footprint. Deliberately nothing but the bookkeeping:
+   * the caller re-runs the roster pass, and the signature diff in `_syncPlots` is what
+   * tears the old plot down and raises it on the new ground — moving the group directly
+   * would leave every world coordinate baked into it (centres, slots, label) pointing at
+   * where the zone used to be.
+   */
+  movePlot(name, dq, dr) {
+    const cells = this.plotCells.get(name)
+    if (!cells || (!dq && !dr)) return
+    this.plotCells.set(name, translateCells(cells, dq, dr))
+  }
+
+  /**
+   * Adopt a whole planned layout at once.
+   *
+   * A drag no longer moves only the zone under the cursor: carrying one out from between its
+   * neighbours strands whatever it was bridging, and `planMove` slides those back into contact
+   * rather than refusing the drop. That arrives as a layout for several zones, and it has to
+   * land in one write — applied one zone at a time, the intermediate states are fragmented
+   * colonies, and any roster pass that ran between them would throw the layout memory away and
+   * re-seed the whole map, which is the exact jump the drag exists to prevent.
+   *
+   * Bookkeeping only, like `movePlot`: the caller re-runs the roster pass, and the signature
+   * diff in `_syncPlots` raises each moved zone on its new ground.
+   */
+  applyLayout(layout) {
+    if (!layout) return
+    for (const [name, cells] of layout) {
+      if (this.plotCells.has(name)) this.plotCells.set(name, cells)
+    }
+  }
+
+  /**
+   * Cosmetic lift while a zone is being dragged. Safe to fake with a raw y-offset because
+   * nothing consults it — the real move is a rebuild on drop, and a cancelled drag sets it
+   * back to zero. Buildings ride along by position: they live in the world group, not the
+   * plot's, so raising the group alone would leave them standing on air.
+   */
+  setPlotLift(name, dy) {
+    const plot = this.plots.get(name)
+    if (!plot) return
+    plot.group.position.y = dy
+    if (plot.label) plot.label.position.y = 3.2 + dy
+    const faded = dy > 0
+    plot.group.traverse((o) => {
+      if (!o.isMesh) return
+      o.material.transparent = faded
+      o.material.opacity = faded ? 0.55 : 1
+    })
+    for (const entry of this.buildings.values()) {
+      if (entry.plot === name) entry.mesh.position.y = DECK_TOP + dy
+    }
+  }
+
   /**
    * Names fade in for the plots that have something going on, and for whichever one you are
    * pointing at. Everywhere else the colony stays unlabelled.
@@ -679,7 +1057,7 @@ export class Colony {
     // Clear of the building's *own* footprint rather than a fixed 2.35: a big habitat blocks
     // more ground than a small one, and a standing spot inside that radius is a spot the
     // crew can never actually reach — it walks at the wall for as long as the thread lives.
-    const blocked = (entry.mesh.userData.footprint || 1.2) * 0.8 + AGENT_RADIUS
+    const blocked = (entry.mesh.userData.footprint || 1.2) * 0.92 + AGENT_RADIUS
     const stand = Math.max(2.35, blocked + 0.5)
     let site = new THREE.Vector3(b.x + Math.cos(a) * stand, 0, b.z + Math.sin(a) * stand)
     // Outward points straight off the zone for a building on its edge, and an astronaut
@@ -693,13 +1071,13 @@ export class Colony {
       const inward = new THREE.Vector3(b.x - Math.cos(a) * stand, 0, b.z - Math.sin(a) * stand)
       if (onPlot(inward)) site = inward
     }
-    // The grid is the one built for the last roster, so this is a best effort — but sites
-    // are recomputed every poll, and anything walled in by a neighbour is nudged out to the
-    // nearest ground somebody can stand on rather than left as a trap.
-    if (this.nav?.isBlocked(site.x, site.z)) {
-      const free = this.nav.nearestFree(site.x, site.z)
-      if (free) site.set(this.nav.toWorld(free.ix), 0, this.nav.toWorld(free.iz))
-    }
+    // Pick against the complete, current map, including scaffolds about to rise. A grid
+    // cell alone is insufficient: it can still be inside a building's keep-out radius.
+    const free = this.nav?.nearestClear(site.x, site.z, PLOT_CELL, (x, z) => {
+      const cell = worldToHex(x, z)
+      return plot.cellKeys.has(`${cell.q},${cell.r}`)
+    }) || this.nav?.nearestClear(site.x, site.z, PLOT_CELL * 2)
+    if (free) site.set(free.x, 0, free.z)
     return site
   }
 
@@ -715,17 +1093,33 @@ export class Colony {
     // One write turns every rotor in the colony.
     buildingUniforms.uTime.value = elapsed
     this.ship.update(dt, elapsed, night)
+    this.switchboard.update(dt, elapsed, night)
+    this.usageCanister.update(dt, elapsed, night)
+    this.usageBursts.update(dt)
 
     this._growBuildings(dt)
     this.astronauts.update(dt, elapsed)
     this.astronauts.updateRings(elapsed)
     this.indicators.update(this.astronauts.agents, elapsed, (a) => this._badgeFor(a))
     this._emit(dt, elapsed)
-    this.particles.ambient(dt, this.camera, this.planet)
+    this._emitMotes(dt, night)
+    this.particles.ambient(dt, this.camera, this.planet, night, (x, z) => this.surfaceAt(x, z))
     this.particles.update(dt)
-    this._updatePlots(night, elapsed)
+    this.water?.update(dt, elapsed, this.camera, night, this.sky.sunDir)
+    this.grass?.update(dt, elapsed)
+    if (this.island) {
+      this.island.update(dt, elapsed, this.camera)
+      this.island.setDaylight(this.sky.dayFactor ?? 1)
+    }
+    this.rock?.update(dt, elapsed)
+    this.fauna.update(dt, elapsed, this.camera, night, this._faunaHooks || (this._faunaHooks = {
+      ripple: (x, z, s) => this.ripple(x, z, s),
+      sound: (name, x, y, z) => this.onSound?.(name, x, y, z),
+    }))
+    this._updatePlots(night, elapsed, dt)
     this._updateScaffolds()
     this._updateLabels(dt)
+    this.reflections.update(dt, focus || this.sky.focus, this.camera)
   }
 
   _growBuildings(dt) {
@@ -755,9 +1149,9 @@ export class Colony {
   _badgeFor(agent) {
     if (agent.state === 'spawning') return BADGE.spawning
     if (agent.state === 'leaving') return BADGE.leaving
-    // Badges only appear once an astronaut has actually reached its post — a stream of
-    // symbols bobbing over a walking crowd is noise.
-    if (agent.state !== 'at-site') return BADGE.none
+    // A badge belongs to the *thread*, not to the spot: an astronaut that has to walk —
+    // shoved off its mark by a neighbour, re-routed round a new building — is still the one
+    // waiting on you, and the symbol that says so must not blink out for the trip.
     return BADGE_FOR[agent.status] ?? BADGE.none
   }
 
@@ -819,29 +1213,106 @@ export class Colony {
     }
   }
 
-  _updatePlots(night, elapsed) {
-    const urgent = this.urgentPlots
-    for (const plot of this.plotOrder) plot.setNight(night, urgent?.has(plot.id) ?? false, elapsed)
+  /**
+   * Light that lives *on* things. Every building near the view sheds a slow mote now and
+   * then — warm by day, its plot's accent after dark, when the windows are lit — the lander's
+   * beacon draws a few of its own, and on a world with anything growing on it the yard fills
+   * with fireflies once the sun is down. Particles spawned around the camera say "weather";
+   * these say "this place is alive".
+   */
+  _emitMotes(dt, night) {
+    if (!this.particles.enabled) return
+    const full = this.settings.get('particles') === 'full'
+    const focus = this.sky.focus
+    const c = this._c
+    const living = this.planet.scatter !== 'rocks'
+    const fireflies = living && night > 0.35
+    // Buildings within reach of the view. Everything else is off screen or too far to read.
+    const reach = full ? 48 : 34
+    const reach2 = reach * reach
+    for (const [id, entry] of this.buildings) {
+      if (entry.retiring || entry.progress < 0.5) continue
+      const p = entry.mesh.position
+      const dx = p.x - focus.x
+      const dz = p.z - focus.z
+      if (dx * dx + dz * dz > reach2) continue
+      const live = this._isActive(id)
+      // A live site glows more; a dark one still breathes.
+      const rate = (live ? 0.9 : 0.28) * (full ? 1 : 0.55) * (0.6 + night * 0.9)
+      if (Math.random() < dt * rate) {
+        const r = 0.9 + Math.random() * 1.4
+        const a = Math.random() * Math.PI * 2
+        if (night > 0.35) c.set(entry.accent).lerp(this._c2.set(0xfff0c0), 0.35).multiplyScalar(2.2)
+        else c.set(0xfff2d0).multiplyScalar(1.6)
+        this.particles.mote(p.x + Math.cos(a) * r, p.y + 0.4 + Math.random() * 1.8, p.z + Math.sin(a) * r, c, 0.055, 4)
+      }
+      if (fireflies && Math.random() < dt * (full ? 0.7 : 0.35) * night) {
+        const r = 1.5 + Math.random() * 3.5
+        const a = Math.random() * Math.PI * 2
+        c.setRGB(1.5, 2.3, 0.55)
+        this.particles.mote(p.x + Math.cos(a) * r, p.y + 0.2 + Math.random() * 1.2, p.z + Math.sin(a) * r, c, 0.07, 5)
+      }
+    }
+    // The lander's beacon and pad lights draw a slow halo of their own.
+    const ship = this.ship.group.position
+    const sdx = ship.x - focus.x
+    const sdz = ship.z - focus.z
+    if (sdx * sdx + sdz * sdz < reach2 && Math.random() < dt * (0.8 + night * 1.4)) {
+      const a = Math.random() * Math.PI * 2
+      const r = 2 + Math.random() * 3
+      c.setRGB(0.7, 1.4, 2.4)
+      this.particles.mote(ship.x + Math.cos(a) * r, ship.y + 0.3 + Math.random() * 5, ship.z + Math.sin(a) * r, c, 0.06, 5)
+    }
   }
 
-  _updateScaffolds() {
+  _updatePlots(night, elapsed, dt) {
+    const urgent = this.urgentPlots
+    for (const plot of this.plotOrder) {
+      const life = this.mcpPulses.get(plot.id)
+      let mcpPulse = 0
+      if (life !== undefined) {
+        const next = life - dt
+        if (next <= 0) this.mcpPulses.delete(plot.id)
+        else this.mcpPulses.set(plot.id, next)
+        mcpPulse = Math.max(0, next) / MCP_PULSE_LIFETIME
+      }
+      plot.setNight(night, urgent?.has(plot.id) ?? false, elapsed, mcpPulse)
+    }
+  }
+
+  /** Which buildings have scaffolding up right now, and where its poles stand. */
+  _scaffoldSites(includePlanned = false) {
     const sites = []
     for (const [id, entry] of this.buildings) {
       // Scaffolding says a thread is running here — the README's own promise. It used to be
       // gated on the building being unfinished as well, which was fine while "unfinished"
       // was most of them and useless the moment buildings stopped standing in a hole.
-      if (entry.progress <= 0.03) continue
+      if (entry.retiring || (!includePlanned && entry.progress <= 0.03)) continue
       if (!this._isActive(id)) continue
       const p = entry.mesh.position
       sites.push({
+        id,
         x: p.x,
         z: p.z,
         y: p.y,
-        radius: (entry.mesh.userData.footprint || 1.4) + 0.35,
+        radius: (entry.mesh.userData.footprint || 1.4) + 0.25,
+        contains: (x, z) => this.plots.get(entry.plot)?.containsWorld(x, z, 0.2),
         height: Math.max(0.6, entry.mesh.userData.height * entry.progress + 0.5),
       })
     }
+    return sites
+  }
+
+  _updateScaffolds() {
+    const sites = this._scaffoldSites()
     this.scaffolds.update(sites)
+    // The poles are things to walk round, so a scaffold going up or coming down is a
+    // change to the ground — but only then; the grid is not rebuilt for a building growing.
+    const signature = sites.map((s) => s.id).join('|')
+    if (signature !== this._scaffoldSignature) {
+      this._scaffoldSignature = signature
+      if (this.nav) this._rebuildNavigation()
+    }
   }
 
   // ── interaction ─────────────────────────────────────────────────────────────────────
@@ -852,6 +1323,56 @@ export class Colony {
 
   agentFor(id) {
     return this.astronauts.byId.get(id)
+  }
+
+  /**
+   * Fire a switchboard beam at a project's zone — called once per new MCP call the poll saw.
+   * It runs from the top of the tower down to the middle of the tile, and the plot's own
+   * border glows for as long as the beam is up — see `Plot.setNight`'s `mcpPulse`, driven
+   * from `this.mcpPulses` in `_updatePlots`.
+   */
+  pulseMcpCall(projectId) {
+    if (!this.settings.get('mcpSwitchboard')) return
+    const plot = this.plots.get(projectId)
+    if (!plot) return
+    const landing = plot.middle.clone()
+    landing.y = DECK_TOP + 0.3
+    this.switchboard.fire(landing, plot.accent)
+    this.mcpPulses.set(plot.id, MCP_PULSE_LIFETIME)
+  }
+
+  /**
+   * Recolour and refill the usage canister for a new month-to-date spend figure. Kept apart
+   * from `pulseSpend`: this runs every poll regardless of whether anything new happened,
+   * while a pulse only fires on an actual delta.
+   */
+  setUsage(spendThisMonth) {
+    this._lastSpend = spendThisMonth
+    this._applyUsage(spendThisMonth)
+  }
+
+  _applyUsage(spendThisMonth) {
+    const budget = this.settings.get('monthlyBudget')
+    // A full tank means plenty of budget left, an empty one means none — the same reading
+    // as a fuel gauge, and the one that agrees with the flag's own "N% left" text rather
+    // than fighting it.
+    const remaining = budget > 0 ? 1 - spendThisMonth / budget : 0
+    const ratio = burnRatio(spendThisMonth, budget)
+    this.usageCanister.setUsage(remaining, ratio)
+  }
+
+  /**
+   * Send a spend orb from the canister to whichever agent just spent something — called once
+   * per delta the poll saw. Silently does nothing for a thread whose project is not part of
+   * this colony's map, the same way `pulseMcpCall` does for an unmapped project.
+   */
+  pulseSpend(agentId, usd) {
+    if (!this.settings.get('usageCanister')) return
+    const agent = this.agentFor(agentId)
+    if (!agent) return
+    const from = this.usageCanister.emitWorld()
+    const to = new THREE.Vector3(agent.pos.x, agent.pos.y + 0.9, agent.pos.z)
+    this.usageBursts.fire(from, to, this.usageCanister.currentColor())
   }
 
   setUiVisible(visible) {
@@ -865,8 +1386,17 @@ export class Colony {
   }
 
   dispose() {
+    this.reflections.dispose()
     this.sky.dispose()
+    this.fauna.dispose()
+    this.grass?.dispose()
+    this.island?.dispose()
+    this.rock?.dispose()
+    this.water?.dispose()
     this.ship.dispose()
+    this.switchboard.dispose()
+    this.usageCanister.dispose()
+    this.usageBursts.dispose()
     this.astronauts.dispose()
     this.indicators.dispose()
     this.particles.dispose()

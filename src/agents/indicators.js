@@ -1,4 +1,6 @@
 import * as THREE from 'three'
+import { OVERLAY_LAYER } from '../core/engine.js'
+import { withCurve } from '../core/curve.js'
 import {
   mdiHelpCircle,
   mdiAlert,
@@ -8,6 +10,7 @@ import {
   mdiSleep,
   mdiCreation,
   mdiLogout,
+  mdiShieldAlert,
 } from '@mdi/js'
 
 /**
@@ -21,7 +24,7 @@ import {
  */
 
 const COLS = 4
-const ROWS = 2
+const ROWS = 3
 
 /** Where the badge's bottom edge sits: a shade above the crown of the helmet. */
 const HEAD_CLEAR = 1.42
@@ -36,9 +39,10 @@ export const BADGE = {
   sleeping: 5,
   spawning: 6,
   leaving: 7,
+  approval: 8, // sitting at a permission prompt
 }
 
-/** Badge tint. Pushed past 1.0 so the bloom pass gives them a soft halo. */
+/** HDR badge tint, tone-mapped with the scene after bloom and depth of field. */
 const BADGE_COLOR = {
   0: [0.42, 1.35, 2.9],
   1: [2.9, 0.6, 0.5],
@@ -48,6 +52,7 @@ const BADGE_COLOR = {
   5: [0.9, 1.0, 1.7],
   6: [2.4, 1.4, 0.75],
   7: [1.2, 1.3, 1.35],
+  8: [2.7, 1.75, 0.4],
 }
 
 /**
@@ -57,6 +62,7 @@ const BADGE_COLOR = {
 const FADE_BY_BADGE = {
   [BADGE.waiting]: 0,
   [BADGE.blocked]: 0,
+  [BADGE.approval]: 0,
   [BADGE.done]: 0.15,
   [BADGE.working]: 0.4,
   [BADGE.spawning]: 0.5,
@@ -87,6 +93,8 @@ export class Indicators {
 
     this.material = this._material()
     this.mesh = new THREE.InstancedMesh(geo, this.material, capacity)
+    // Drawn after bloom and tilt-shift, so the symbol stays readable over any scene depth.
+    this.mesh.layers.set(OVERLAY_LAYER)
     this.mesh.count = 0
     this.mesh.frustumCulled = false
     this.mesh.renderOrder = 10
@@ -117,6 +125,7 @@ export class Indicators {
 
     material.onBeforeCompile = (shader) => {
       shader.uniforms.uFrameScale = { value: new THREE.Vector2(1 / COLS, 1 / ROWS) }
+      withCurve(shader)
       this.uniforms = shader.uniforms
 
       shader.vertexShader = shader.vertexShader
@@ -133,7 +142,7 @@ export class Indicators {
         .replace('#include <uv_vertex>', `#include <uv_vertex>\n vMapUv = uv * uFrameScale + aFrame;`)
         .replace(
           '#include <project_vertex>',
-          `vec4 mvPosition = modelViewMatrix * vec4( aCenter, 1.0 );
+          `vec4 mvPosition = viewMatrix * vec4( bcBend( ( modelMatrix * vec4( aCenter, 1.0 ) ).xyz ), 1.0 );
            float dist = -mvPosition.z;
            // Mostly-constant screen size: the linear term cancels perspective so a badge
            // stays readable when the camera is pulled right out, while the constant term
@@ -256,7 +265,17 @@ export class Indicators {
  * — the glyph has to carry as a silhouette. Material's set is drawn filled to begin with,
  * one closed path per icon, so there is nothing to stroke and nothing to parse.
  */
-const ICON_PATHS = [mdiHelpCircle, mdiAlert, mdiHammer, mdiCheckBold, mdiPause, mdiSleep, mdiCreation, mdiLogout]
+const ICON_PATHS = [
+  mdiHelpCircle,
+  mdiAlert,
+  mdiHammer,
+  mdiCheckBold,
+  mdiPause,
+  mdiSleep,
+  mdiCreation,
+  mdiLogout,
+  mdiShieldAlert,
+]
 
 /**
  * The badge atlas. Red channel = the glyph, green channel = the plate's alpha — packing two

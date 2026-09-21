@@ -39,6 +39,30 @@ export async function readTail(file, bytes) {
   }
 }
 
+/**
+ * Everything appended to a file since a given byte offset — the incremental sibling of
+ * `readHead`/`readTail`, for scans that only care what is new since they last looked.
+ *
+ * Trims to the last complete line, same as `readHead` does at its end, and reports how far
+ * it actually got so the caller's watermark only ever advances past whole records: a line
+ * still being written when this runs is left for the next call rather than parsed half-done.
+ */
+export async function readRange(file, start) {
+  const fh = await fsp.open(file, 'r')
+  try {
+    const { size } = await fh.stat()
+    if (size <= start) return { text: '', end: start }
+    const want = size - start
+    const buf = Buffer.allocUnsafe(want)
+    const { bytesRead } = await fh.read(buf, 0, want, start)
+    const lastNewline = buf.lastIndexOf(0x0a, bytesRead - 1)
+    if (lastNewline < 0) return { text: '', end: start }
+    return { text: buf.subarray(0, lastNewline + 1).toString('utf8'), end: start + lastNewline + 1 }
+  } finally {
+    await fh.close()
+  }
+}
+
 /** Parse a JSONL blob, skipping the partial or malformed lines a live file always has. */
 export function jsonLines(text) {
   const out = []

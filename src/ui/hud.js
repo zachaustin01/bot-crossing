@@ -24,7 +24,8 @@ import { PLOT_PALETTE, hashString } from '../world/plots.js'
  * here rather than asked for.
  */
 const IS_MAC = /Mac/.test(navigator.platform)
-const FILE_MANAGER = IS_MAC ? 'Finder' : /Win/.test(navigator.platform) ? 'Explorer' : 'Files'
+const IS_WIN = /Win/.test(navigator.platform)
+const FILE_MANAGER = IS_MAC ? 'Finder' : IS_WIN ? 'Explorer' : 'Files'
 
 const ICON = {
   settings: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
@@ -46,14 +47,17 @@ const ICON = {
   copy: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>`,
   locate: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="7.6"/><path d="M12 1.8v2.6M12 19.6v2.6M1.8 12h2.6M19.6 12h2.6"/></svg>`,
   orbit: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="4"/><ellipse cx="12" cy="12" rx="10.2" ry="4.6" transform="rotate(-24 12 12)"/><circle cx="21" cy="8.2" r="1.5" fill="currentColor" stroke="none"/></svg>`,
+  sound: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5z"/><path d="M15.5 9a4 4 0 0 1 0 6"/><path d="M18 6.5a8 8 0 0 1 0 11"/></svg>`,
+  soundOff: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg>`,
 }
 
 const STAT_DEFS = [
   { key: 'working', label: 'building', cls: 'working' },
   { key: 'waiting', label: 'need you', cls: 'waiting' },
+  { key: 'approval', label: 'needs approval', cls: 'approval' },
   { key: 'blocked', label: 'blocked', cls: 'blocked' },
   { key: 'celebrating', label: 'shipped', cls: 'done' },
-  { key: 'agents', label: 'crew', cls: 'idle' },
+  { key: 'agents', label: 'bots', cls: 'idle' },
 ]
 
 export class Hud {
@@ -76,6 +80,11 @@ export class Hud {
     this._buildAvatar()
     this._wire()
     this.syncSettings()
+    // Read layout when panels resize/change, never in the animation loop.
+    this._layoutObserver = new ResizeObserver(() => this._syncLayout())
+    this._layoutObserver.observe(this.el)
+    this._layoutObserver.observe(this.$('.side'))
+    this._syncLayout()
   }
 
   // ── construction ────────────────────────────────────────────────────────────────────
@@ -88,7 +97,7 @@ export class Hud {
       b.className = `stat ${def.cls}`
       b.type = 'button'
       b.dataset.key = def.key
-      b.title = `Jump to the next ${def.label} astronaut`
+      b.title = `Jump to the next ${def.label} bot`
       b.innerHTML = `<i class="pip"></i><span class="n">0</span><span class="lbl">${def.label}</span>`
       b.type = 'button'
       b.addEventListener('click', () => this.actions.focusStatus?.(def.key))
@@ -172,7 +181,7 @@ export class Hud {
       ),
       this._toggle('Adaptive quality', 'autoQuality', 'Quietly drops render scale if frames get expensive.'),
       this._slider('Scatter', 'scatterDensity', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`),
-      this._slider('Max crew', 'maxAgents', 10, 200, 10, (v) => String(v)),
+      this._slider('Max bots', 'maxAgents', 10, 200, 10, (v) => String(v)),
       this._toggle('Stars', 'stars')
     )
     body.appendChild(perf)
@@ -237,6 +246,21 @@ export class Hud {
 
     // View.
     const view = group('View')
+    // The server refuses terminals on Windows, so a choice there would only ever toast an error.
+    if (!IS_WIN) {
+      view.append(
+        this._select(
+          'Open threads in',
+          'openIn',
+          [
+            ['app', 'Desktop app'],
+            ['terminal', 'Terminal'],
+          ],
+          'Terminal runs the harness’s own CLI in a new window, so the CLI has to be installed. ' +
+            'BOT_CROSSING_TERMINAL or $TERMINAL picks the emulator.'
+        )
+      )
+    }
     view.append(
       this._toggle(
         'Hide dormant repos',
@@ -245,13 +269,72 @@ export class Hud {
       )
     )
     view.append(
+      this._toggle('Follow selected bot', 'followSelected', 'Tracks the selected bot until you deselect. Drag to pan, right-drag to orbit, and scroll to zoom.'),
       this._toggle('Return to isometric', 'autoFrame', 'Eases the angle back when you stop dragging.'),
       this._slider('Field of view', 'fov', 20, 60, 1, (v) => `${v}°`),
       this._toggle('Project labels', 'showLabels'),
       this._toggle('Reduced motion', 'reducedMotion', 'Calms the bobbing and the camera easing.'),
-      this._toggle('Show FPS', 'showFps')
+      this._toggle('Show FPS', 'showFps'),
+      this._toggle('MCP switchboard', 'mcpSwitchboard', 'The relay tower that beams a plot — and glows its border — when a thread calls an MCP tool.'),
+      this._toggle('Usage canister', 'usageCanister', 'The tank of goo standing for this month’s estimated spend, and the orbs it sends when an agent spends something.'),
+      this._slider(
+        'Monthly budget',
+        'monthlyBudget',
+        50,
+        5000,
+        50,
+        (v) => `$${v}`,
+        'What the usage canister fills and colours against. Set this to match your own plan — the estimate has no way to know it.'
+      )
     )
     body.appendChild(view)
+
+    // Look.
+    const look = group('Look')
+    look.append(
+      this._slider(
+        'Ambient occlusion',
+        'ambientOcclusion',
+        0,
+        1,
+        0.05,
+        (v) => v === 0 ? 'Off' : `${Math.round(v * 100)}%`,
+        'Soft shading in creases and where surfaces meet. Try 20–35% for a subtle effect; 0 turns it off.'
+      ),
+      this._slider(
+        'World curve',
+        'worldCurve',
+        0,
+        1,
+        0.05,
+        (v) => `${Math.round(v * 100)}%`,
+        'How far the ground bends away toward the horizon. The point under the cursor never moves.'
+      ),
+      this._toggle('Colour grade', 'colorGrade', 'Saturation, warmth, lifted shadows and a soft vignette on the finished frame.'),
+      this._slider('Saturation', 'saturation', 0.6, 1.5, 0.05, (v) => v.toFixed(2)),
+      this._slider('Vignette', 'vignette', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`),
+      this._toggle('Clouds', 'clouds', 'Cumulus drifting over worlds that have weather.'),
+      this._select('Wildlife', 'fauna', [
+        ['off', 'Off'],
+        ['low', 'Some'],
+        ['full', 'Full'],
+      ])
+    )
+    body.appendChild(look)
+
+    // Sound.
+    const sound = group('Sound')
+    sound.append(
+      this._toggle(
+        'Ambient sound',
+        'sound',
+        'A bed for each world, things calling out on their own clocks, and work you can hear where it is happening. Louder as you lean in.'
+      ),
+      this._slider('Master', 'masterVolume', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`),
+      this._slider('Ambience', 'ambienceVolume', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, 'Beds and the sounds of the world.'),
+      this._slider('Effects', 'effectsVolume', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, 'Hammering, drones, splashes, the chime when somebody needs you.')
+    )
+    body.appendChild(sound)
   }
 
   _row(label, hint) {
@@ -270,6 +353,7 @@ export class Hud {
     b.type = 'button'
     b.className = 'toggle'
     b.setAttribute('role', 'switch')
+    b.setAttribute('aria-label', label)
     b.addEventListener('click', () => this.settings.set(key, !this.settings.get(key)))
     row.appendChild(b)
     this.controls.push({
@@ -310,6 +394,7 @@ export class Hud {
     wrap.style.cssText = 'display:flex;align-items:center;gap:8px'
     const input = document.createElement('input')
     input.type = 'range'
+    input.setAttribute('aria-label', label)
     input.className = 'slider'
     input.min = min
     input.max = max
@@ -352,19 +437,41 @@ export class Hud {
     const on = (sel, ev, fn) => this.$(sel).addEventListener(ev, fn)
 
     on('#btn-settings', 'click', () => this.toggleSettings())
+    // On a phone the sidebar is a sheet: a tap on its brand row (not on its buttons) pulls
+    // it up or lets it drop, and a drag on the row does the same by direction.
+    const brandbar = this.$('.side .brandbar')
+    const grab = this.$('.side .grab')
+    let dragY = null
+    const startDrag = (e) => {
+      if (!this.isPhone() || e.target.closest('.btn')) return
+      dragY = e.clientY
+    }
+    const endDrag = (e) => {
+      if (dragY === null) return
+      const dy = e.clientY - dragY
+      dragY = null
+      if (Math.abs(dy) > 24) this.toggleSheet(dy < 0)
+      else if (!e.target.closest('.btn')) this.toggleSheet()
+    }
+    for (const el of [brandbar, grab]) {
+      el.addEventListener('pointerdown', startDrag)
+      el.addEventListener('pointerup', endDrag)
+    }
     on('#btn-close-settings', 'click', () => this.toggleSettings(false))
     on('#btn-hide', 'click', () => this.toggleUi())
     on('#btn-help', 'click', () => this.toggleHelp())
     on('#btn-shot', 'click', () => this.actions.screenshot?.())
     on('#btn-home', 'click', () => this.actions.resetView?.())
-    on('#btn-next', 'click', () => this.actions.focusStatus?.('waiting'))
+    on('#btn-next', 'click', () => this.actions.focusStatus?.(['waiting', 'approval', 'blocked']))
     on('#btn-orbit', 'click', () => this.setOrbit(this.actions.toggleOrbit?.()))
     on('#btn-planet', 'click', () => this.actions.cyclePlanet?.())
     on('#btn-time', 'click', () => this.actions.cycleTime?.())
+    on('#btn-sound', 'click', () => this.settings.set('sound', !this.settings.get('sound')))
     on('#btn-open', 'click', () => this.actions.openThread?.())
     on('#btn-viewed', 'click', () => this.actions.markViewed?.())
     on('#btn-archive', 'click', () => this.actions.archiveThread?.())
     on('#btn-deselect', 'click', () => this.actions.select?.(null))
+    on('#btn-follow', 'click', () => this.settings.set('followSelected', !this.settings.get('followSelected')))
     on('#btn-new-session', 'click', () => this.actions.newConversation?.())
     on('#btn-new-session-pick', 'click', (e) => {
       e.stopPropagation()
@@ -391,8 +498,27 @@ export class Hud {
   // ── state in ────────────────────────────────────────────────────────────────────────
 
   syncSettings() {
+    const follow = Boolean(this.settings.get('followSelected'))
+    this.$('#btn-follow').setAttribute('aria-pressed', String(follow))
+    this.$('#btn-follow').title = follow ? 'Stop following selected bot' : 'Follow selected bot'
     for (const c of this.controls) c.sync()
     this.$('.fps').classList.toggle('on', Boolean(this.settings.get('showFps')))
+    const sound = Boolean(this.settings.get('sound'))
+    const btn = this.$('#btn-sound')
+    btn.innerHTML = sound ? ICON.sound : ICON.soundOff
+    btn.setAttribute('aria-pressed', String(sound))
+    btn.title = sound ? 'Mute (M)' : 'Unmute (M)'
+  }
+
+  /** The plain-numbers backstop next to the usage canister — the visual is a gauge, not a
+   *  ledger, so the actual figures live here where they can be read exactly. */
+  setUsage(spendThisMonth, budget) {
+    const el = this.$('.usage-readout')
+    if (!el) return
+    const text = `$${Math.round(spendThisMonth).toLocaleString()} / $${Math.round(budget).toLocaleString()} this month`
+    if (this._last.usage === text) return
+    this._last.usage = text
+    el.textContent = text
   }
 
   setStats(stats) {
@@ -508,10 +634,18 @@ export class Hud {
       if (this._last.project === null) return
       this._last.project = null
       panel.classList.remove('drilled')
+      panel.classList.remove('open')
+      this._syncLayout()
       return
     }
 
     this.project = project
+    // On a phone, opening a repo pulls the sheet up so its threads are in view — unless an
+    // astronaut was just picked, whose card wants the room above the sheet's peek.
+    if (this.isPhone() && !this.selected && !panel.classList.contains('open')) {
+      panel.classList.add('open')
+      this._syncLayout()
+    }
     // The minute is part of the signature because `ago()` is: without it a repo where
     // nothing is happening keeps whatever "4m ago" it was first drawn with, for as long as
     // you leave the panel open.
@@ -536,7 +670,9 @@ export class Hud {
     this.$('#btn-copy-path').disabled = !project.path
 
     const n = project.threads.length
-    const waiting = project.threads.filter((t) => t.status === 'waiting' || t.status === 'blocked').length
+    const waiting = project.threads.filter(
+      (t) => t.status === 'waiting' || t.status === 'blocked' || t.status === 'approval'
+    ).length
     this.$('.side .threads-head').innerHTML =
       `<span>${n} thread${n === 1 ? '' : 's'}</span>` + (waiting ? `<span class="want">${waiting} need you</span>` : '')
 
@@ -593,6 +729,8 @@ export class Hud {
     }
     this.selected = { agent, thread }
     card.classList.add('on')
+    // On a phone the card docks above the sheet's peek, so the sheet drops to make room.
+    if (this.isPhone()) this.toggleSheet(false)
 
     this.$('.thread-pop .title').textContent = thread.title || 'Untitled thread'
     const status = STATUS_LABEL[agent.status] || agent.status
@@ -600,7 +738,9 @@ export class Hud {
     const bits = [
       `<span class="tag"><i class="swatch" style="background:${hex(agent.trim.getHex())}"></i>${escapeHtml(status)}</span>`,
     ]
-    // The repo is the panel's own heading now, so the card says what the *thread* is.
+    // The repo is the panel's own heading now, so the card says what the *thread* is —
+    // starting with whose it is, since that decides what Open can do.
+    if (thread.harnessName) bits.push(`<span class="tag">${escapeHtml(thread.harnessName)}</span>`)
     if (thread.worktree) bits.push(`<span class="tag">⑂ ${escapeHtml(thread.worktree)}</span>`)
     if (thread.gitBranch) bits.push(`<span class="tag">${escapeHtml(thread.gitBranch)}</span>`)
     if (thread.model) bits.push(`<span class="tag">${escapeHtml(shortModel(thread.model))}</span>`)
@@ -635,6 +775,14 @@ export class Hud {
       if (this._cardOn) {
         this._cardOn = false
         el.classList.remove('on')
+      }
+      return
+    }
+    // On a phone the card is docked above the sheet by the stylesheet; nothing to place.
+    if (this.isPhone()) {
+      if (!this._cardOn) {
+        this._cardOn = true
+        el.classList.add('on')
       }
       return
     }
@@ -679,9 +827,26 @@ export class Hud {
     }
   }
 
-  /** How much of the right-hand edge the sidebar is taking, so the card can avoid it. */
-  setSideWidth(px) {
-    this._sideWidth = px
+  /** Share one measured safe area between camera framing, cards, and the legend. */
+  _syncLayout() {
+    const width = this.el.clientWidth
+    const height = this.el.clientHeight
+    const side = this.$('.side')
+    let right = 0
+    let bottom = 0
+    if (this.visible) {
+      if (this.isPhone()) {
+        // Use the sheet's destination, not an intermediate animation transform.
+        const peek = parseFloat(getComputedStyle(this.el).getPropertyValue('--peek')) || 0
+        const top = side.offsetTop + (side.classList.contains('open') ? 0 : side.offsetHeight - peek)
+        bottom = Math.max(0, height - top)
+      } else {
+        right = Math.max(0, width - side.offsetLeft)
+      }
+    }
+    this._sideWidth = right
+    this.el.style.setProperty('--side', `${right}px`)
+    this.actions.viewportChanged?.({ width, height, right, bottom })
   }
 
   /** The card shows the harness mark when it has one, else the blinking face. */
@@ -817,13 +982,32 @@ export class Hud {
     this.$('#btn-orbit').setAttribute('aria-pressed', String(Boolean(on)))
   }
 
+  /** Whether the layout is the phone one: the sheet, the docked card, the top rail. */
+  isPhone() {
+    return window.matchMedia('(max-width: 600px)').matches
+  }
+
+  /** Pull the sidebar sheet up over the colony, or let it drop to its peek. Phone only. */
+  toggleSheet(force) {
+    const side = this.$('.side')
+    const open = force ?? !side.classList.contains('open')
+    side.classList.toggle('open', open)
+    this._syncLayout()
+    return open
+  }
+
   toggleSettings(force) {
     const panel = this.$('.settings')
     const open = force ?? panel.classList.contains('closed')
     panel.classList.toggle('closed', !open)
     this.$('#btn-settings').setAttribute('aria-pressed', String(open))
-    // Both live in the same slot on the right; the sidebar steps aside rather than hides.
-    this.$('.side').classList.toggle('shifted', open)
+    // Settings replaces the sidebar in its existing slot, including for keyboard users.
+    const side = this.$('.side')
+    side.classList.toggle('covered', open)
+    side.inert = open
+    panel.inert = !open
+    if (open) this.$('#btn-close-settings').focus({ preventScroll: true })
+    else if (panel.contains(document.activeElement)) this.$('#btn-settings').focus({ preventScroll: true })
   }
 
   toggleHelp(force) {
@@ -842,6 +1026,7 @@ export class Hud {
     this.el.classList.toggle('hidden', !this.visible)
     this.$('#btn-hide').innerHTML = this.visible ? ICON.eye : ICON.eyeOff
     this.actions.uiVisibility?.(this.visible)
+    this._syncLayout()
     if (!this.visible) this.toggleHelp(false)
     return this.visible
   }
@@ -909,6 +1094,7 @@ function statusClass(status) {
   if (status === 'working') return 'working'
   if (status === 'waiting') return 'waiting'
   if (status === 'blocked') return 'blocked'
+  if (status === 'approval') return 'approval'
   if (status === 'celebrating') return 'done'
   return 'idle'
 }
@@ -967,6 +1153,7 @@ function ago(ts) {
 
 const TEMPLATE = `
 <aside class="side panel">
+  <div class="grab"></div>
   <header class="brandbar">
     <div class="brand"><i class="dot"></i>Bot Crossing</div>
     <button class="btn icon ghost" id="btn-shot" title="Screenshot (P)">${ICON.camera}</button>
@@ -976,6 +1163,7 @@ const TEMPLATE = `
   </header>
 
   <div class="stats"></div>
+  <div class="usage-readout"></div>
 
   <div class="side-body">
     <div class="projects-pane">
@@ -1019,14 +1207,16 @@ const TEMPLATE = `
 
 <div class="rail panel">
   <button class="btn icon" id="btn-home" title="Reset the view (0)">${ICON.home}</button>
-  <button class="btn icon" id="btn-next" title="Next astronaut waiting on you (N)">${ICON.next}</button>
+  <button class="btn icon" id="btn-next" title="Next astronaut that needs you (N)">${ICON.next}</button>
   <div class="sep"></div>
   <button class="btn icon" id="btn-orbit" title="Orbit mode — sweep around the colony (O)" aria-pressed="false">${ICON.orbit}</button>
   <button class="btn icon" id="btn-planet" title="Change planet (Tab)">${ICON.globe}</button>
   <button class="btn icon" id="btn-time" title="Change the time of day (L)">${ICON.sun}</button>
+  <div class="sep"></div>
+  <button class="btn icon" id="btn-sound" title="Mute (M)" aria-pressed="true">${ICON.sound}</button>
 </div>
 
-<div class="settings panel closed">
+<div class="settings panel closed" inert>
   <header>Settings <button class="btn icon ghost" id="btn-close-settings" title="Close">${ICON.close}</button></header>
   <div class="body"></div>
 </div>
@@ -1039,13 +1229,14 @@ const TEMPLATE = `
       <div class="title"></div>
       <div class="meta"></div>
     </div>
+    <button class="btn icon ghost" id="btn-follow" title="Follow selected bot" aria-label="Follow selected bot" aria-pressed="false">${ICON.locate}</button>
     <button class="btn icon ghost" id="btn-deselect" title="Deselect (Esc)">${ICON.close}</button>
   </div>
   <div class="progress"><i></i></div>
   <div class="pair">
     <button class="btn primary" id="btn-open" title="Open this thread in the harness it came from (Enter)">${ICON.open} Open</button>
     <button class="btn" id="btn-viewed" title="Stop this thread asking for you until it moves on again (V)">${ICON.eye} Viewed</button>
-    <button class="btn" id="btn-archive" title="Archive — this astronaut walks back to the ship (A)">${ICON.archive} Archive</button>
+    <button class="btn" id="btn-archive" title="Archive — this bot walks back to the ship (A)">${ICON.archive} Archive</button>
   </div>
 </div>
 
@@ -1078,6 +1269,11 @@ const TEMPLATE = `
         <div class="k"><span>Orbit mode</span><kbd>O</kbd></div>
         <div class="k"><span>Change planet</span><kbd>Tab</kbd></div>
         <div class="k"><span>Time of day</span><kbd>L</kbd></div>
+        <div class="k"><span>Mute</span><kbd>M</kbd></div>
+        <div class="k"><span>Next crew (zone)</span><kbd>J</kbd></div>
+        <div class="k"><span>Next crew (colony)</span><kbd>⇧J</kbd></div>
+        <div class="k"><span>Next repo</span><kbd>K</kbd></div>
+        <div class="k"><span>Busiest crew member</span><kbd>B</kbd></div>
         <div class="k"><span>Deselect</span><kbd>Esc</kbd></div>
         <div class="k"><span>This sheet</span><kbd>?</kbd></div>
       </div>

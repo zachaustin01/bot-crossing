@@ -2,6 +2,7 @@ import * as THREE from 'three'
 import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js'
 import { mulberry } from './planet.js'
 import { ATLAS, CELL, atlasTexture, cellMask, part } from './kit.js'
+import { withCurve } from '../core/curve.js'
 
 /**
  * Colony buildings — one per thread, assembled out of KayKit's *Space Base Bits* (CC0) and
@@ -34,6 +35,14 @@ export const buildingUniforms = {
   uNight: { value: 0 },
   /** Seconds, for anything that turns. One write drives every rotor in the colony. */
   uTime: { value: 0 },
+  /**
+   * A planet's colour on the hull. The neutral structural swatches lean toward this when
+   * the amount is up — desert clay turns the same kit into adobe — and because it is
+   * shared, switching planet re-themes every standing building with two writes and no
+   * rebuild. Amount 0 is a true no-op, so the other worlds cost nothing.
+   */
+  uPlanetTint: { value: new THREE.Color(1, 1, 1) },
+  uPlanetTintAmount: { value: 0 },
 }
 
 /**
@@ -45,6 +54,8 @@ export const buildingUniforms = {
  * gap at the plot's 4.4-unit slot spacing.
  */
 const BUILDING_SCALE = 1.45
+// Includes accessories and rotated corners. Ring slots have 2.15 m to the kerb.
+export const BUILDING_RADIUS = 2
 
 /** The top face of a base module — where roof modules and masts stack. */
 const DECK = 1.0
@@ -82,6 +93,13 @@ for (const [cell, [r, m]] of Object.entries(SURFACE)) {
 
 /** The one swatch the accent repaints, and the one that lights up after dark. */
 const ACCENT_MASK = cellMask([CELL.TRIM])
+
+/**
+ * The swatches the planet tint is allowed to touch: the neutral hull and frame greys.
+ * Everything with a colour of its own — trim, solar glass, the red — keeps it, or the
+ * repaint flattens a building into a single-tone lump.
+ */
+const PLANET_TINT_MASK = cellMask([CELL.WHITE, CELL.GREY, CELL.SLATE])
 
 // ── composition ───────────────────────────────────────────────────────────────────────
 
@@ -264,6 +282,7 @@ const KIND_IDS = Object.keys(KINDS)
 function decorate(material, uniforms) {
   material.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms)
+    withCurve(shader)
 
     shader.vertexShader = shader.vertexShader
       .replace(
@@ -323,7 +342,10 @@ function decorate(material, uniforms) {
          uniform float uMinY;
          uniform vec3 uAccent;
          uniform float uNight;
+         uniform vec3 uPlanetTint;
+         uniform float uPlanetTintAmount;
          uniform float uCellAccent[ ${CELL_COUNT} ];
+         uniform float uCellPlanetTint[ ${CELL_COUNT} ];
          uniform float uCellRoughness[ ${CELL_COUNT} ];
          uniform float uCellMetalness[ ${CELL_COUNT} ];
 
@@ -350,6 +372,13 @@ function decorate(material, uniforms) {
       .replace(
         '#include <color_fragment>',
         `#include <color_fragment>
+         // The planet's own colour on the neutral hull swatches, before the accent gets
+         // its say — same luminance trick, so panels keep their shading as they change.
+         float tintAmount = uCellPlanetTint[ cell ] * uPlanetTintAmount;
+         if ( tintAmount > 0.0 ) {
+           float tintLum = dot( diffuseColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
+           diffuseColor.rgb = mix( diffuseColor.rgb, uPlanetTint * clamp( tintLum * 1.9, 0.3, 1.5 ), tintAmount );
+         }
          float accentAmount = uCellAccent[ cell ];
          if ( accentAmount > 0.0 ) {
            float lum = dot( diffuseColor.rgb, vec3( 0.2126, 0.7152, 0.0722 ) );
@@ -384,6 +413,7 @@ function depthMaterial(uniforms) {
   const mat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking })
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms)
+    withCurve(shader)
     shader.vertexShader = shader.vertexShader
       .replace(
         '#include <common>',
@@ -441,15 +471,21 @@ export function createBuilding({ seed = 1, accent = 0xc96442, kind = null } = {}
   const c = new Composer()
   const label = KINDS[chosen](c, rand, accent)
   const geo = c.finish()
-  // Trimmed to fit a slot: the catalogue is authored on the pack's module grid and scaled
-  // once here, so tuning the plot lattice never means re-tuning ten recipes.
-  geo.scale(BUILDING_SCALE, BUILDING_SCALE, BUILDING_SCALE)
+  let radius = 0
+  const positions = geo.getAttribute('position')
+  for (let i = 0; i < positions.count; i++) {
+    radius = Math.max(radius, Math.hypot(positions.getX(i), positions.getZ(i)))
+  }
+  // Fit the complete recipe, including its barrels/rover, at any yaw. Measuring only
+  // the X/Z bounds missed corners and left accessories hanging beyond the deck.
+  const scale = Math.min(BUILDING_SCALE, BUILDING_RADIUS / Math.max(radius, 0.001))
+  geo.scale(scale, scale, scale)
   // `scale()` transforms position and normal and nothing else, so a custom attribute that
   // holds a *position* has to be taken along by hand. Miss this and a rotor turns about a
   // hub left behind at the unscaled height — the blades orbit a point below themselves.
   const pivot = geo.getAttribute('aPivot')
   if (pivot) {
-    for (let i = 0; i < pivot.count * 3; i++) pivot.array[i] *= BUILDING_SCALE
+    for (let i = 0; i < pivot.count * 3; i++) pivot.array[i] *= scale
     pivot.needsUpdate = true
   }
   geo.computeBoundingBox()
@@ -469,7 +505,10 @@ export function createBuilding({ seed = 1, accent = 0xc96442, kind = null } = {}
     uAccent: { value: new THREE.Color(accent) },
     uNight: buildingUniforms.uNight,
     uTime: buildingUniforms.uTime,
+    uPlanetTint: buildingUniforms.uPlanetTint,
+    uPlanetTintAmount: buildingUniforms.uPlanetTintAmount,
     uCellAccent: { value: ACCENT_MASK },
+    uCellPlanetTint: { value: PLANET_TINT_MASK },
     uCellRoughness: { value: ROUGHNESS },
     uCellMetalness: { value: METALNESS },
   }
@@ -546,7 +585,10 @@ export class Scaffolds {
     for (const site of sites) {
       for (let i = 0; i < 4 && n < this.capacity; i++) {
         const a = (i / 4) * Math.PI * 2 + 0.78
-        d.position.set(site.x + Math.cos(a) * site.radius, site.y, site.z + Math.sin(a) * site.radius)
+        const x = site.x + Math.cos(a) * site.radius
+        const z = site.z + Math.sin(a) * site.radius
+        if (site.contains && !site.contains(x, z)) continue
+        d.position.set(x, site.y, z)
         d.rotation.set(0, a, 0)
         d.scale.set(1, Math.max(0.4, site.height), 1)
         d.updateMatrix()

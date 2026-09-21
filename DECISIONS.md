@@ -17,7 +17,7 @@ the app rewrote the record from memory the next time it touched the thread. Hold
 together took a re-assert on every scan, a `ps` sweep to guess whether the app had re-read the
 file, and a *pending* state for the gap between them.
 
-So archiving is the colony's own bookkeeping now. The astronaut walks back to the ship exactly
+So archiving is the colony's own bookkeeping now. The bot walks back to the ship exactly
 as before, and archiving in the harness's own UI still sends it home too, because the scan reads
 that flag. `setArchived` is not part of the adapter interface and adding one back is a bug.
 
@@ -53,8 +53,13 @@ the server decides what to do with it:
   claims exits quietly and used to reach the page as "Opened". Failing that, `command` runs in a
   terminal. Failing that, the page is told the truth.
 
-`command` is `{ argv, cwd }` with an absolute `argv[0]`. No harness knowledge reaches
-`launch()` — that seam is the reason `server/harnesses/` is swappable at all.
+When the page asks for a terminal instead, the URL is not consulted on any platform:
+`command` runs in a terminal, or the page is told the CLI is missing.
+It never falls back to the app, because the person chose a terminal.
+Which terminal is `BOT_CROSSING_TERMINAL`, then `$TERMINAL`, then the desktop's own, then whatever is installed.
+
+`command` is `{ argv, cwd }` with an absolute `argv[0]`, offered on every platform when the CLI can be found.
+No harness knowledge reaches `launch()` — that seam is the reason `server/harnesses/` is swappable at all.
 
 ## `sizeBytes` is bytes
 
@@ -86,3 +91,21 @@ That means a PR can be closed unmerged and still be the reason something shipped
 happens the commit says so and the contributor is credited by name. It is a worse deal for
 contributors than merging their commit, and it is written down here so nobody has to discover
 it from a closed tab.
+
+## Sound samples are not committed; every sound has a synth
+
+`public/audio/` is gitignored apart from its README. Sample libraries — Splice, and most
+stock libraries — license their sounds for use *in* a work, not for redistribution on their
+own, and a public MIT repository is redistribution. So the registry in `src/audio/sounds.js`
+refuses to load if any name lacks a procedural generator: the game is fully audible from a
+fresh clone, and real recordings are an override by name through `manifest.json` on the
+machine that owns them. Sounds under CC0 may be committed, with a line in `CREDITS.md`.
+
+## Every hand-written shader calls `withCurve`
+
+The world curve is patched into three's own `project_vertex`, so built-in materials bend
+without knowing about it and pick their uniforms up from the material prototype's
+`onBeforeCompile`. A material that installs its *own* `onBeforeCompile` replaces that, and
+has to call `withCurve(shader)` itself — otherwise its uniforms are zero, it stays flat, and
+it floats above the ground that bent away under it. Same for a custom depth material, or its
+shadow stays flat while it does not.

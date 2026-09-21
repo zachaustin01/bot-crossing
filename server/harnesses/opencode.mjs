@@ -1,34 +1,21 @@
 /**
- * Harness adapter: OpenCode — sessions in a SQLite database, not on disk.
+ * Harness adapter: OpenCode — sessions in a local SQLite database.
  *
- * Each build keeps its own database next to the others: `opencode.db` for
- * stable, `opencode-dev.db` for the dev build (review builds land beside them
- * as `opencode-review-<port>.db` and are deliberately not read — ephemeral).
- * Every file present is scanned and its threads tagged with which build owns
- * them, because a session id only resolves in the app that wrote it.
+ * Each build keeps its own database: `opencode.db` for stable, `opencode-dev.db`
+ * for the dev build (review builds land beside them as `opencode-review-<port>.db`
+ * and are deliberately not read — ephemeral). Every file present is scanned.
+ * `$OPENCODE_DB` names one file outright; `$BOT_CROSSING_OPENCODE_DB` does the
+ * same for fixture tests.
  *
- * That last point bounds what opening can promise. `opencode://` is claimed by
- * every installed build and the OS routes it to exactly one of them, so a deep
- * link for a session from another build fronts an app that does not know that
- * id. There is nothing to address a single build with — the scheme is shared.
+ * One bound on opening: `opencode://` is claimed by every installed build and
+ * the OS routes it to exactly one of them, so a session id only resolves in
+ * the app that wrote it. There is nothing to address a single build with —
+ * the scheme is shared.
  *
- * Each database holds one row per session in `session` (id, directory, title,
- * model as JSON, `time_*` in epoch ms) with transcript parts in `part`
- * (`session_id`, `data`). Task/subagent runs are child rows with `parent_id`
- * set — not conversations anybody had, so they are hidden. Turn state comes
- * from the transcript tail, not from any status row: only a tool call frozen
- * past its grace period reads as parked on the user (waiting/unread) — a
- * fresh one is the model mid-thought, even when still `pending`, because
- * parts are born pending while arguments stream in. The grace is tool-aware
- * (`question` never legitimately executes; `bash`/`task` can run for many
- * minutes), and everything is freshness-gated so crashed sidecars' fossil
- * `running` parts stay buried.
- *
- * Opening is a per-session deep link against the desktop's local server:
- * `opencode://open-session?server=sidecar&session=<id>` activates the tab for
- * that session. The CLI resume (`opencode --session <id>`) rides along with it,
- * which is what lands on the session on Linux when no app claims the scheme —
- * there the server runs the command in a terminal instead.
+ * Only top-level sessions count as threads — child rows with `parent_id` set
+ * are the task tool's subagents, and OpenCode's own session list filters them
+ * the same way. Including them would stand hundreds of astronauts on the map
+ * that nobody ever talked to.
  *
  * Read-only, without exception, and no subprocess anywhere.
  */
@@ -37,11 +24,47 @@ import os from 'node:os'
 import { exists, findExecutable, num } from '../lib/fsutil.mjs'
 
 const HOME = os.homedir()
-const DATA_DIR = path.join(HOME, '.local', 'share', 'opencode')
+
+/** Where this machine keeps OpenCode databases, honouring XDG like the app does. */
+const dataDir = () => {
+  const xdg = process.env.XDG_DATA_HOME
+  if (typeof xdg === 'string' && xdg) return path.join(xdg, 'opencode')
+  return path.join(HOME, '.local', 'share', 'opencode')
+}
+
 /** The stable database first, then the dev build's — every file present is read. */
-export const defaultDbFiles = () => [path.join(DATA_DIR, 'opencode.db'), path.join(DATA_DIR, 'opencode-dev.db')]
-/** Overridable for tests to a single file, the way `BOT_CROSSING_CURSOR_PROJECTS` is. */
-const dbFiles = () => (process.env.BOT_CROSSING_OPENCODE_DB ? [process.env.BOT_CROSSING_OPENCODE_DB] : defaultDbFiles())
+export const defaultDbFiles = () => {
+  const files = [path.join(dataDir(), 'opencode.db'), path.join(dataDir(), 'opencode-dev.db')]
+  if (process.platform === 'darwin' && !process.env.XDG_DATA_HOME) {
+    const mac = path.join(HOME, 'Library', 'Application Support', 'opencode')
+    files.push(path.join(mac, 'opencode.db'), path.join(mac, 'opencode-dev.db'))
+  }
+  return files
+}
+
+/**
+ * Which files to read. `$BOT_CROSSING_OPENCODE_DB` (fixtures) and `$OPENCODE_DB`
+ * each name one file outright: a missing file means "absent", not "fall back to
+ * the default and read a database the user did not name". That is also what
+ * makes fixture tests isolate from the real store.
+ */
+async function dbFiles() {
+  if (process.env.BOT_CROSSING_OPENCODE_DB) return [process.env.BOT_CROSSING_OPENCODE_DB]
+  const override = process.env.OPENCODE_DB
+  if (typeof override === 'string' && override) return (await exists(override)) ? [override] : []
+  return defaultDbFiles()
+}
+
+/**
+ * `node:sqlite` is imported lazily and its absence is survivable.
+ *
+ * It needs Node 22.13, which `package.json` asks for — but asking is not
+ * enforcing, and a top level import would take the whole server down on an
+ * older Node rather than costing one harness. This way every other harness
+ * keeps working and `diagnostic()` explains the gap.
+ */
+let sqlitePromise
+const sqliteApi = () => (sqlitePromise ??= import('node:sqlite').catch(() => null))
 
 /** Prefixed, per the contract in `server/harnesses/README.md`. */
 const ID = (raw) => `opencode:${raw}`
@@ -54,352 +77,227 @@ const SESSION_ID = /^ses_[A-Za-z0-9]+$/
 const isSessionId = (v) => typeof v === 'string' && SESSION_ID.test(v)
 const isAbsDir = (v) => typeof v === 'string' && path.isAbsolute(v)
 
-/**
- * `node:sqlite` is imported lazily and its absence is survivable, the same
- * shape `codex.mjs` ended up in: it needs Node 22.13, which `package.json`
- * asks for — but asking is not enforcing, and a top level import would take
- * the whole server down on an older Node rather than costing one harness.
- */
-let sqlitePromise
-const sqliteApi = () => (sqlitePromise ??= import('node:sqlite').catch(() => null))
+/** OpenCode writes nothing when it is killed, so an open turn needs a time bound too. */
+const ACTIVE_WINDOW_MS = 30 * 60 * 1000
 
-/**
- * `model` is a JSON string like `{"id":"…","providerID":"…","variant":"…"}` on
- * recent versions and a plain id on older ones. Either way the card wants the
- * id; anything unparseable degrades to empty rather than throwing the scan.
- */
-function modelId(raw) {
-  if (typeof raw !== 'string') return ''
-  const text = raw.trim()
-  if (!text) return ''
-  if (!text.startsWith('{')) return text
+const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim()
+
+function parseModel(raw) {
+  if (!raw) return { model: '', effort: '' }
   try {
-    const id = JSON.parse(text)?.id
-    return typeof id === 'string' ? id : ''
+    const m = typeof raw === 'string' ? JSON.parse(raw) : raw
+    return {
+      model: typeof m?.id === 'string' ? m.id : '',
+      effort: typeof m?.variant === 'string' ? m.variant : ''
+    }
   } catch {
-    return ''
+    return { model: '', effort: '' }
   }
 }
 
 function projectOf(directory) {
-  const dir = isAbsDir(directory) ? directory : ''
-  return { projectPath: dir, project: dir ? path.basename(dir) : 'unknown' }
+  const dir = typeof directory === 'string' ? directory : ''
+  if (!dir) return { projectPath: '', project: 'unknown', cwd: '' }
+  // Both separators: a Windows directory arrives with either, and `basename`
+  // on one OS must still read a path written on another (tests use posix).
+  const base = path.basename(dir.replace(/\\/g, '/'))
+  return { projectPath: dir, project: base || 'unknown', cwd: dir }
 }
 
-/** Transcript bytes per session, in one query — the field buildings are scaled on. */
-function partSizes(db, tables) {
-  if (!tables.has('part')) return new Map()
+/** First user text per session never changes, so it is kept forever. */
+const previewCache = new Map()
+
+async function firstUserText(db, sessionId) {
+  if (previewCache.has(sessionId)) return previewCache.get(sessionId)
+  let out = ''
   try {
-    const cols = new Set(db.prepare('PRAGMA table_info(part)').all().map((r) => r.name))
-    if (!cols.has('session_id') || !cols.has('data')) return new Map()
-    const rows = db.prepare('SELECT session_id, SUM(LENGTH(data)) AS bytes FROM part GROUP BY session_id').all()
-    return new Map(rows.map((r) => [r.session_id, num(r.bytes)]))
+    const msgs = db
+      .prepare(`SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC LIMIT 8`)
+      .all(sessionId)
+    for (const m of msgs) {
+      let role = ''
+      try {
+        role = JSON.parse(m.data)?.role || ''
+      } catch {
+        continue
+      }
+      if (role !== 'user') continue
+      const parts = db
+        .prepare(`SELECT data FROM part WHERE message_id = ? ORDER BY time_created ASC LIMIT 8`)
+        .all(m.id)
+      for (const p of parts) {
+        try {
+          const d = JSON.parse(p.data)
+          if (d?.type === 'text' && typeof d.text === 'string' && clean(d.text)) {
+            out = clean(d.text)
+            break
+          }
+        } catch {
+          /* a part mid-write — skip it */
+        }
+      }
+      if (out) break
+    }
   } catch {
-    return new Map()
+    out = ''
   }
-}
-
-/**
- * How recently a session must have moved to count as "now".
- *
- * One sidecar serves every session, so there is no per-thread process to
- * probe — and a `running` part can be a fossil from a dead server (seen in
- * the wild: an `edit` still `running` three days later). Anything older than
- * this window reads as history, never as work. Same duration as the Claude
- * adapter's window, for the same reason.
- */
-const ACTIVE_WINDOW_MS = 30 * 60 * 1000
-
-/**
- * How long an open tool call may sit without an update before it reads as
- * parked on the user rather than executing. `question` never legitimately
- * runs — it asks and waits — so its grace is short. `bash` and `task` can
- * run for many minutes, so theirs is long; everything else finishes in
- * seconds when it is actually executing.
- */
-const QUESTION_GRACE_MS = 90 * 1000
-const TOOL_PARKED_GRACE_MS = 3 * 60 * 1000
-/**
- * How long a finished tool call still counts as the turn in motion. Without
- * this the astronaut drops to idle in the gap between one tool completing and
- * the next starting — mid-task sessions flicker working/idle every poll.
- */
-const WORKING_GRACE_MS = 2 * 60 * 1000
-const LONG_TOOL_PARKED_GRACE_MS = 15 * 60 * 1000
-const LONG_TOOLS = new Set(['bash', 'task'])
-/**
- * How long the latest text must sit untouched before a trailing question
- * counts. Streaming text ends with `?` mid-sentence all the time; only a
- * settled turn asking reads as parked.
- */
-const TEXT_SETTLED_MS = 60 * 1000
-
-/**
- * Per-session turn state from transcript tails, in aggregate queries —
- * never one query per session, the scan runs on a poll.
- *
- * Pending approvals and questions live only in the sidecar's memory, so what
- * the database can say is where the transcript stopped — and `pending` does
- * NOT mean parked: parts are born `pending` with empty input while arguments
- * stream in, and flip to `running` on the `tool-call` event, while approvals
- * park an already-`running` call. Either way, only a call frozen past its
- * grace period reads as parked; a fresh one is the model mid-thought. The
- * grace is tool-aware because a `question` never legitimately executes while
- * a `bash` can run for many minutes.
- */
-function turnStates(db, tables, now) {
-  const out = new Map()
-  const blank = () => ({ parked: 0, active: 0, endsWithQuestion: false, questionAt: 0, errorAt: 0, progressAt: 0, workAt: 0, errorTimed: true, lastRole: '' })
-  const cutoff = now - ACTIVE_WINDOW_MS
-  if (tables.has('part')) {
-    try {
-      const cols = new Set(db.prepare('PRAGMA table_info(part)').all().map((r) => r.name))
-      if (!cols.has('session_id') || !cols.has('data')) return out
-      if (cols.has('time_updated')) {
-        // Open tool calls — one row each, evaluated in JS because the grace
-        // depends on which tool is parked.
-        const rows = db
-          .prepare(
-            `SELECT session_id, json_extract(data,'$.tool') AS tool,
-              json_extract(data,'$.state.status') AS status, time_updated
-             FROM part
-             WHERE json_extract(data,'$.type') = 'tool'
-               AND json_extract(data,'$.state.status') IN ('pending','running')
-               AND time_updated > ${cutoff}`
-          )
-          .all()
-        for (const r of rows) {
-          if (typeof r.session_id !== 'string' || !r.session_id) continue
-          const entry = out.get(r.session_id) ?? blank()
-          const grace =
-            r.tool === 'question'
-              ? QUESTION_GRACE_MS
-              : LONG_TOOLS.has(r.tool)
-                ? LONG_TOOL_PARKED_GRACE_MS
-                : TOOL_PARKED_GRACE_MS
-          if (now - num(r.time_updated) > grace) entry.parked += 1
-          else entry.active += 1
-          out.set(r.session_id, entry)
-        }
-      } else {
-        // Ancient schema without `time_updated`: count every open call as
-        // active and let the session timestamp bound fossils instead.
-        const rows = db
-          .prepare(
-            `SELECT session_id, COUNT(*) AS open
-             FROM part
-             WHERE json_extract(data,'$.type') = 'tool'
-               AND json_extract(data,'$.state.status') IN ('pending','running')
-             GROUP BY session_id`
-          )
-          .all()
-        for (const r of rows) {
-          if (typeof r.session_id !== 'string' || !r.session_id) continue
-          const entry = out.get(r.session_id) ?? blank()
-          entry.active += num(r.open)
-          out.set(r.session_id, entry)
-        }
-      }
-      // Latest tool outcome per session, for the error rule: an error only
-      // slumps the astronaut while nothing newer supersedes it.
-      if (cols.has('time_updated')) {
-        const rows = db
-          .prepare(
-            `SELECT session_id,
-              MAX(CASE WHEN json_extract(data,'$.type') = 'tool'
-                AND json_extract(data,'$.state.status') = 'error' THEN time_updated ELSE 0 END) AS error_at,
-              MAX(CASE WHEN json_extract(data,'$.type') = 'tool'
-                AND json_extract(data,'$.state.status') IN ('completed','running','pending')
-                THEN time_updated ELSE 0 END) AS progress_at,
-              MAX(CASE WHEN json_extract(data,'$.type') = 'tool'
-                AND json_extract(data,'$.state.status') IN ('completed','running','pending')
-                AND json_extract(data,'$.tool') != 'question'
-                THEN time_updated ELSE 0 END) AS work_at
-            FROM part GROUP BY session_id`
-          )
-          .all()
-        for (const r of rows) {
-          if (typeof r.session_id !== 'string' || !r.session_id) continue
-          const entry = out.get(r.session_id) ?? blank()
-          entry.errorAt = num(r.error_at)
-          entry.progressAt = num(r.progress_at)
-          entry.workAt = num(r.work_at)
-          entry.errorTimed = true
-          out.set(r.session_id, entry)
-        }
-      } else {
-        const rows = db
-          .prepare(
-            `SELECT session_id,
-              SUM(CASE WHEN json_extract(data,'$.type') = 'tool'
-                AND json_extract(data,'$.state.status') = 'error' THEN 1 ELSE 0 END) AS error_at
-            FROM part GROUP BY session_id`
-          )
-          .all()
-        for (const r of rows) {
-          if (typeof r.session_id !== 'string' || !r.session_id) continue
-          const entry = out.get(r.session_id) ?? blank()
-          entry.errorAt = num(r.error_at)
-          entry.progressAt = 0
-          entry.workAt = 0
-          entry.errorTimed = false
-          out.set(r.session_id, entry)
-        }
-      }
-    } catch {
-      /* a session mid-write — no turn state this pass */
-    }
-  }
-  if (tables.has('message')) {
-    try {
-      const cols = new Set(db.prepare('PRAGMA table_info(message)').all().map((r) => r.name))
-      if (cols.has('session_id') && cols.has('data') && cols.has('time_created')) {
-        // Newest first, so the first row seen per session is its latest message.
-        const rows = db
-          .prepare(`SELECT session_id, json_extract(data,'$.role') AS role FROM message ORDER BY time_created DESC`)
-          .all()
-        const seen = new Set()
-        for (const r of rows) {
-          if (typeof r.session_id !== 'string' || !r.session_id || seen.has(r.session_id)) continue
-          seen.add(r.session_id)
-          const entry = out.get(r.session_id) ?? blank()
-          entry.lastRole = typeof r.role === 'string' ? r.role : ''
-          out.set(r.session_id, entry)
-        }
-      }
-    } catch {
-      /* a session mid-write — roles stay unknown */
-    }
-  }
-  // Newest assistant text per session: a turn that ends asking is parked on
-  // the user even though every tool call completed — the `question` tool is
-  // not the only way the agent asks. Only the shape counts (ends with a
-  // question mark); only the latest text counts (an answered question keeps
-  // working, which the tool rules already report).
-  if (tables.has('part')) {
-    try {
-      const cols = new Set(db.prepare('PRAGMA table_info(part)').all().map((r) => r.name))
-      if (cols.has('session_id') && cols.has('data') && cols.has('time_created') && cols.has('time_updated')) {
-        const rows = db
-          .prepare(
-            `SELECT session_id, json_extract(data,'$.text') AS text, time_updated FROM part
-             WHERE json_extract(data,'$.type') = 'text' ORDER BY time_created DESC`
-          )
-          .all()
-        const seen = new Set()
-        for (const r of rows) {
-          if (typeof r.session_id !== 'string' || !r.session_id || seen.has(r.session_id)) continue
-          seen.add(r.session_id)
-          if (typeof r.text !== 'string') continue
-          const trimmed = r.text.trim().replace(/["'”’)\]]+$/, '')
-          if (!trimmed.endsWith('?')) continue
-          const entry = out.get(r.session_id) ?? blank()
-          entry.endsWithQuestion = true
-          entry.questionAt = num(r.time_updated)
-          out.set(r.session_id, entry)
-        }
-      }
-    } catch {
-      /* a session mid-write — no question check this pass */
-    }
-  }
+  previewCache.set(sessionId, out)
   return out
 }
 
-/** One database file's threads. Exported so tests can point at fixtures directly. */
-export async function scanDbFile(dbFile) {
+/** Costly facts kept against `time_updated`, so an unchanged session is read once. */
+const factsCache = new Map()
+
+/**
+ * Whether an error-status tool part means the run failed.
+ *
+ * Seen in the wild: `The user rejected permission to use this specific tool
+ * call.` and `Tool execution aborted` — both are the user stopping the turn,
+ * not the turn failing. Only a genuine failure reddens an astronaut.
+ */
+function isRealError(raw) {
+  let text = ''
+  try {
+    const d = typeof raw === 'string' ? JSON.parse(raw) : raw
+    const state = d?.state || {}
+    text = `${state.error || ''}\n${state.output || ''}`
+  } catch {
+    return true
+  }
+  return !/user rejected permission|permission.{0,20}denied|denied.{0,20}permission|execution aborted|aborted|cancelled/i.test(text)
+}
+
+async function sessionFacts(db, sessionId, timeUpdated) {
+  const hit = factsCache.get(sessionId)
+  if (hit && hit.timeUpdated === timeUpdated) return hit.facts
+  const facts = { running: false, hasError: false, sizeBytes: 0 }
+  // Counted separately: a store with only one of the two tables still sizes
+  // from the half it has, rather than zeroing both on one throw.
+  try {
+    const msgBytes = db.prepare(`SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM message WHERE session_id = ?`).get(sessionId)
+    facts.sizeBytes += num(msgBytes?.n)
+  } catch {
+    /* no message table — the parts still count */
+  }
+  try {
+    const partBytes = db.prepare(`SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM part WHERE session_id = ?`).get(sessionId)
+    facts.sizeBytes += num(partBytes?.n)
+  } catch {
+    facts.sizeBytes += 0
+  }
+  try {
+    const last = db
+      .prepare(`SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created DESC, rowid DESC LIMIT 1`)
+      .get(sessionId)
+    if (last?.data) {
+      const d = JSON.parse(last.data)
+      const completed = d?.time?.completed
+      const finished = typeof d?.finish === 'string' && d.finish
+      const msgError = typeof d?.error?.name === 'string' ? d.error.name : ''
+      const aborted = /abort/i.test(msgError)
+      // A trailing user message means the model speaks next — whatever the
+      // process is doing, it is not waiting on anyone. A turn that ended in
+      // error or abort is over too, even when it carries no finish stamp.
+      const open = d?.role === 'user' || (d?.role === 'assistant' && !completed && !finished && !msgError)
+      facts.running = open && Date.now() - num(timeUpdated) < ACTIVE_WINDOW_MS
+      if (d?.role === 'assistant' && (completed || finished || msgError)) {
+        if (aborted) {
+          // The user stopped the turn. Same as pressing escape elsewhere:
+          // an abandoned turn is not a failed one.
+          facts.hasError = false
+        } else if (msgError) {
+          // The turn itself failed (provider/auth error) — that is what the
+          // red eyes are for, even when no single tool part takes the blame.
+          facts.hasError = true
+        } else {
+          // Only the last turn counts: a historic tool error must not redden
+          // an astronaut forever. And a turn the *user* stopped is not a
+          // failure — a rejected permission or an aborted call is this
+          // harness's version of pressing escape.
+          const candidates = db
+            .prepare(
+              `SELECT data FROM part WHERE message_id IN (SELECT id FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT 3) AND data LIKE '%"status":"error"%' LIMIT 5`
+            )
+            .all(sessionId)
+          facts.hasError = candidates.some((row) => isRealError(row?.data))
+        }
+      }
+    }
+  } catch {
+    /* mid-write, or gone */
+  }
+  factsCache.set(sessionId, { timeUpdated, facts })
+  return facts
+}
+
+async function readDbFile(dbFile) {
   const sqlite = await sqliteApi()
   if (!sqlite?.DatabaseSync) return []
-  // Which build owns these threads — a session id only resolves in its own app.
-  const source = path.basename(dbFile) === 'opencode-dev.db' ? 'dev-db' : 'db'
   let db
   try {
     db = new sqlite.DatabaseSync(dbFile, { readOnly: true })
   } catch {
     // A WAL database whose shared-memory file cannot be used refuses a
-    // read-only open. Better no threads from this build this pass than no scan.
+    // read-only open. Losing one database beats losing the scan.
     return []
   }
   try {
     const tables = new Set(
-      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name)
+      db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all().map((r) => r.name)
     )
+    // Only `session` is load-bearing: the message/part reads below degrade to
+    // empty facts when their tables are absent, rather than costing the pass.
     if (!tables.has('session')) return []
-    const columns = new Set(db.prepare('PRAGMA table_info(session)').all().map((r) => r.name))
-    for (const required of ['id', 'directory']) {
-      if (!columns.has(required)) return []
+    // Undocumented private state that drifts between versions — probe every
+    // column before naming it, or one renamed column costs the whole harness.
+    const cols = new Set(db.prepare(`PRAGMA table_info(session)`).all().map((r) => r.name))
+    for (const need of ['id', 'directory', 'title', 'time_created', 'time_updated']) {
+      if (!cols.has(need)) return []
     }
-    // Every column is probed before it is named: this is undocumented private
-    // state and a `SELECT` naming a column that has gone throws away the pass.
-    const select = (name, fallback) => (columns.has(name) ? `${name}` : `${fallback} AS ${name}`)
     const rows = db
       .prepare(
-        `SELECT id, directory,
-          ${select('title', "''")}, ${select('model', "''")},
-          ${select('parent_id', 'NULL')}, ${select('time_archived', 'NULL')},
-          ${select('time_created', '0')}, ${select('time_updated', '0')}
-        FROM session`
+        `SELECT id, directory, title, agent, model, time_created, time_updated, time_archived FROM session ${cols.has('parent_id') ? 'WHERE parent_id IS NULL' : ''} ORDER BY time_updated DESC`
       )
       .all()
-    const sizes = partSizes(db, tables)
-    const now = Date.now()
-    const cutoff = now - ACTIVE_WINDOW_MS
-    const turns = turnStates(db, tables, now)
     const out = []
-    for (const row of rows) {
-      if (typeof row.id !== 'string' || !row.id) continue
-      if (row.parent_id != null) continue // a task run, not a conversation
-      const { projectPath, project } = projectOf(row.directory)
-      const cwd = isAbsDir(row.directory) ? row.directory : ''
-      // Where the transcript stopped decides the astronaut's posture: a call
-      // frozen past its grace is parked on the user, as is a settled turn
-      // whose last word is a question; a fresh call, or an unanswered-you
-      // prompt, means the agent holds the turn. An error only slumps it
-      // while it is the latest tool outcome — newer completed work means the
-      // turn recovered. Archived threads are home regardless of what their
-      // tail says.
-      const turn = turns.get(row.id) ?? { parked: 0, active: 0, endsWithQuestion: false, questionAt: 0, errorAt: 0, progressAt: 0, workAt: 0, errorTimed: true, lastRole: '' }
-      const fresh = now - num(row.time_updated) < ACTIVE_WINDOW_MS
-      const archived = row.time_archived != null
-      const asked = turn.endsWithQuestion && turn.active === 0 && turn.lastRole === 'assistant' && now - turn.questionAt > TEXT_SETTLED_MS
-      const waiting = !archived && fresh && (turn.parked > 0 || asked)
-      // A tool finished seconds ago is still the turn in motion — the next
-      // call (or the verdict on this one) has simply not landed yet. A
-      // completed `question` is settled asking, not work, so it is tracked
-      // separately and excluded here.
-      const recentWork = now - turn.workAt < WORKING_GRACE_MS
-      const running = !archived && fresh && !waiting && (turn.active > 0 || turn.lastRole === 'user' || recentWork)
-      const errored = turn.errorTimed
-        ? turn.errorAt > turn.progressAt && turn.errorAt > cutoff
-        : turn.errorAt > 0
+    for (const r of rows) {
+      if (typeof r.id !== 'string' || !r.id) continue
+      const { projectPath, project, cwd } = projectOf(r.directory)
+      const { model, effort } = parseModel(r.model)
+      const prompt = await firstUserText(db, r.id)
+      const title = clean(r.title) || prompt || 'Untitled thread'
+      const facts = await sessionFacts(db, r.id, num(r.time_updated))
       out.push({
-        id: ID(row.id),
-        title: String(row.title || '').trim() || 'Untitled thread',
-        preview: '',
+        id: ID(r.id),
+        title: title.slice(0, 120),
+        preview: prompt.slice(0, 240),
         project,
         projectPath,
+        // OpenCode has no worktree concept of its own, and guessing one from
+        // the path would put a branch name on a thread that never had one.
         worktree: '',
         cwd,
         gitBranch: '',
-        model: modelId(row.model),
-        effort: '',
-        createdAt: num(row.time_created),
-        lastActivityAt: num(row.time_updated),
-        // OpenCode records no focus history, so "have you looked at this" is
-        // unknowable — not false. A parked turn overrides that: waiting is
-        // the only way a thread can ask for anything at all.
+        model,
+        effort,
+        createdAt: num(r.time_created),
+        lastActivityAt: num(r.time_updated),
+        // No focus history, so "have you looked at this" is unknowable — not false.
         lastFocusedAt: 0,
-        unread: waiting,
-        running,
-        hasError: errored,
+        unread: false,
+        running: facts.running,
+        hasError: facts.hasError,
         starred: false,
         routine: '',
         prState: '',
-        archived: row.time_archived != null,
-        sizeBytes: sizes.get(row.id) || 0,
-        source,
-        canOpen: isSessionId(row.id) && isAbsDir(cwd),
-        ref: { sessionId: row.id, cwd },
+        archived: r.time_archived !== null && r.time_archived !== undefined,
+        // Bytes, like every other harness: the field is a shared log scale
+        // across the whole map, and a token count would make OpenCode
+        // buildings taller than Claude ones for the same work.
+        sizeBytes: facts.sizeBytes,
+        source: typeof r.agent === 'string' ? r.agent : '',
+        canOpen: isSessionId(r.id) && isAbsDir(cwd),
+        ref: { sessionId: r.id, cwd }
       })
     }
     return out
@@ -415,21 +313,30 @@ export async function scanDbFile(dbFile) {
 }
 
 async function scanThreads() {
-  const threads = await Promise.all(dbFiles().map((f) => scanDbFile(f)))
+  const threads = await Promise.all((await dbFiles()).map((f) => readDbFile(f)))
   return threads.flat()
 }
 
 /**
- * Where the `opencode` CLI is. PATH first, then the places its installer puts
+ * Where the `opencode` CLI is. PATH first, then the places its installers put
  * it — never inside an application bundle.
  */
-const CLI_DIRS = [path.join(HOME, '.opencode', 'bin'), path.join(HOME, '.local', 'bin')]
+const CLI_DIRS = [
+  path.join(HOME, '.opencode', 'bin'),
+  path.join(HOME, '.local', 'bin'),
+  '/usr/local/bin',
+  '/usr/bin',
+]
 const cliBinary = () => findExecutable('opencode', CLI_DIRS)
 
 /**
  * Opens the exact session in the desktop app. `server=sidecar` addresses the
- * desktop's own local server; the CLI resume rides along for Linux, where the
- * server runs it in a terminal when no app claims the scheme.
+ * desktop's own local server; the CLI resume rides along so the terminal
+ * choice (`via=terminal`) and the Linux fallback land on the session too.
+ *
+ * Provisional: no per-session route is documented upstream — if the installed
+ * build ignores the hostname the app fronts with nothing selected, and this
+ * goes back to the honest refusal.
  */
 async function openThread(ref) {
   const sessionId = ref?.sessionId
@@ -452,15 +359,20 @@ async function newSession(dir) {
   return { ok: true, url, command }
 }
 
+async function detect() {
+  return (await Promise.all((await dbFiles()).map((f) => exists(f)))).some(Boolean)
+}
+
 /**
- * Why a present OpenCode might still look thin. Without this the Node case is
- * invisible: the databases are simply skipped and nothing says why.
+ * Why a present OpenCode might still look thin. Without this the old-Node case
+ * is invisible: the databases are simply skipped, every thread is missing, and
+ * nothing says why.
  */
 async function diagnostic() {
-  const found = (await Promise.all(dbFiles().map((f) => exists(f)))).some(Boolean)
+  const found = (await Promise.all((await dbFiles()).map((f) => exists(f)))).some(Boolean)
   if (!found) return ''
   if (!(await sqliteApi())?.DatabaseSync) {
-    return `OpenCode threads need Node 22.13 or newer (running ${process.versions.node})`
+    return `OpenCode threads need Node 22.13 or newer for their sessions (running ${process.versions.node})`
   }
   return ''
 }
@@ -468,10 +380,10 @@ async function diagnostic() {
 export default {
   id: 'opencode',
   name: 'OpenCode',
-  detect: async () => (await Promise.all(dbFiles().map((f) => exists(f)))).some(Boolean),
+  detect,
   diagnostic,
   scanThreads,
   openThread,
   newSession,
-  paths: { dir: DATA_DIR },
+  paths: {},
 }

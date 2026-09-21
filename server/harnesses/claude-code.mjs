@@ -10,14 +10,16 @@
  * archiving in `server/harnesses/README.md`.
  *
  * Two stores, deliberately merged rather than picked between:
- *   - the desktop app keeps one JSON record per thread (title, cwd, model, timestamps)
+ *   - the desktop app keeps one JSON record per thread (title, cwd, model, timestamps), and
+ *     leaves a marker behind for each thread deleted in it
  *   - the CLI keeps the raw transcript, which is the only source for terminal-started work
  */
 import fsp from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { exists, findExecutable, jsonLines, listDirs, listFiles, num, readHead, readTail } from '../lib/fsutil.mjs'
+import { exists, findExecutable, jsonLines, listDirs, listFiles, num, readHead, readRange, readTail } from '../lib/fsutil.mjs'
+import { estimateCost } from '../usage.mjs'
 
 const HOME = os.homedir()
 
@@ -32,8 +34,27 @@ function desktopDataDir() {
     case 'linux':
       return path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, '.config'), 'Claude')
     default:
-      return path.join(HOME, 'Library', 'Application Support', 'Claude')
+      return macDataDir()
   }
+}
+
+/**
+ * macOS has two answers as well, because the app ships under two Electron app names: the
+ * classic `Claude`, and `Claude-3p`, which is what a current install writes to. Both can be
+ * present at once — an older install leaves an empty `Claude` behind, and an empty directory
+ * is indistinguishable from the app never having been installed. Hard-coding `Claude` there
+ * means every desktop thread is missed, and the colony falls back to drawing the CLI
+ * transcript alone: no title, no model, and `Open` resorts to `claude://resume`, which
+ * imports rather than navigates.
+ *
+ * So pick whichever one actually holds session records, the same rule windowsDataDir uses
+ * below — and, like it, resolved once at import, so installing the app under the colony
+ * wants a restart to be noticed.
+ */
+function macDataDir() {
+  const support = path.join(HOME, 'Library', 'Application Support')
+  const candidates = [path.join(support, 'Claude-3p'), path.join(support, 'Claude')]
+  return candidates.find((dir) => existsSync(path.join(dir, 'claude-code-sessions'))) || candidates[1]
 }
 
 /**
@@ -71,12 +92,30 @@ function windowsDataDir() {
   return candidates.find((dir) => existsSync(path.join(dir, 'claude-code-sessions'))) || roaming
 }
 
+/**
+ * Both roots take an override, which is how the tests fake an install without touching a real
+ * one. `CLAUDE_CONFIG_DIR` is the CLI's own: a shell that sets it has its transcripts written
+ * there, so the variable that moves the CLI's home moves where the colony looks for it too.
+ * `BOT_CROSSING_CLAUDE_DESKTOP` names the session store itself, the sibling of Cursor's
+ * `BOT_CROSSING_CURSOR_PROJECTS`.
+ */
 /** Where the Claude desktop app keeps one JSON record per thread. */
-const DESKTOP_SESSIONS = path.join(desktopDataDir(), 'claude-code-sessions')
+const DESKTOP_SESSIONS =
+  process.env.BOT_CROSSING_CLAUDE_DESKTOP || path.join(desktopDataDir(), 'claude-code-sessions')
+/** The CLI's home: `~/.claude`, unless the CLI itself has been told otherwise. */
+const CLI_HOME = process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude')
 /** Where the CLI keeps the raw transcript: ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl */
-const CLI_PROJECTS = path.join(HOME, '.claude', 'projects')
+const CLI_PROJECTS = path.join(CLI_HOME, 'projects')
 /** One file per live CLI process: {pid, sessionId, cwd, ...}. Stale files outlive their pid. */
-const CLI_LIVE = path.join(HOME, '.claude', 'sessions')
+const CLI_LIVE = path.join(CLI_HOME, 'sessions')
+/**
+ * One marker file per session sitting at a permission prompt right now, named `<sessionId>.json`.
+ * Nothing here writes it — a `Notification` hook the user installs themselves (see
+ * `server/hooks/README.md`) drops the file when the prompt appears and removes it once the tool
+ * proceeds or is denied. Deliberately outside `~/.claude`: that directory is Claude Code's own,
+ * and this adapter is read-only against it, same as everything else in this file.
+ */
+const BLOCKED_DIR = path.join(HOME, '.bot-crossing', 'blocked')
 
 const HEAD_BYTES = 192 * 1024
 
@@ -87,6 +126,21 @@ const HEAD_BYTES = 192 * 1024
  * warmed ones sat 16 hours to 3 days idle while genuinely active work was minutes old.
  */
 const ACTIVE_WINDOW_MS = 30 * 60 * 1000
+
+/**
+ * How long a subagent's transcript may sit untouched before its errand counts as abandoned.
+ * A subagent runs inside its parent's process, so the pid probe the rest of this file uses does
+ * not exist for it, and one that is thinking writes nothing for minutes at a time — at two or
+ * three minutes they blink out while still working.
+ */
+const SUBAGENT_WINDOW_MS = 10 * 60 * 1000
+
+/**
+ * A brief can be long: 36 of 147 transcripts on this machine open with more than 8 KB, the
+ * largest at 17 KB. `readHead` drops a trailing partial line, so a head that is too small yields
+ * nothing at all rather than a truncated task.
+ */
+const SUBAGENT_HEAD_BYTES = 64 * 1024
 
 /**
  * Every id this adapter hands out is prefixed. `server/harnesses/README.md` asks for ids unique
@@ -172,7 +226,16 @@ function decodeProjectDir(name) {
   return name.startsWith('-') ? '/' + name.slice(1).replace(/-/g, '/') : name
 }
 
-/** Index every CLI transcript on disk, keyed by session id. */
+/**
+ * Index every CLI transcript on disk, keyed by session id.
+ *
+ * A session id is only unique *per directory* it has ever run in — resuming it from a git
+ * worktree, or any other second checkout, writes a second `<id>.jsonl` under a different
+ * `projectDir` rather than moving the first. Without a tiebreaker the later `listDirs` entry
+ * would win regardless of which copy is actually live, so a worktree's now-stale copy could
+ * overwrite the real one just by sorting after it. The newer file is always the live one: an
+ * abandoned copy stops being written to the moment the session moves on.
+ */
 async function scanTranscripts() {
   const byId = new Map()
   for (const projectDir of await listDirs(CLI_PROJECTS)) {
@@ -184,6 +247,8 @@ async function scanTranscripts() {
       } catch {
         continue
       }
+      const existing = byId.get(id)
+      if (existing && existing.mtime >= stat.mtimeMs) continue
       byId.set(id, { id, file, projectDir, size: stat.size, mtime: stat.mtimeMs })
     }
   }
@@ -228,6 +293,212 @@ async function awaitingReply(file) {
   return false
 }
 
+/**
+ * The server name out of an MCP tool's own name, e.g. `mcp__ccd_session__mark_chapter` →
+ * `ccd_session` — this is Claude Code's naming convention for every MCP-provided tool, and
+ * the only signal available for telling one apart from a built-in like `Read` or `Bash`.
+ * A server or tool name may itself hold single underscores, so this splits on the first
+ * `__` after the prefix rather than on every underscore.
+ */
+function mcpServerOf(name) {
+  if (typeof name !== 'string' || !name.startsWith('mcp__')) return null
+  const rest = name.slice(5)
+  const sep = rest.indexOf('__')
+  return sep === -1 ? null : rest.slice(0, sep)
+}
+
+/**
+ * How far into each transcript the MCP-call scan has already read, by session id for a
+ * parent transcript and by absolute path for a subagent's own file (a subagent has no session
+ * id of its own to key on). Seeded to "the end of the file, right now" the first time a file
+ * is seen, rather than to zero — otherwise the very first scan of a machine with months of
+ * history would report every MCP call ever made as having "just happened," and would pay for
+ * parsing all of it besides.
+ */
+const mcpWatermark = new Map()
+const mcpSubagentWatermark = new Map()
+
+/** Every `tool_use` record past `start` that names an MCP tool, plus how far the read reached. */
+async function mcpCallsSince(file, start) {
+  let range
+  try {
+    range = await readRange(file, start)
+  } catch {
+    return null
+  }
+  if (!range.text) return { calls: [], end: range.end }
+  const calls = []
+  for (const r of jsonLines(range.text)) {
+    if (r.type !== 'assistant') continue
+    const content = r.message?.content
+    if (!Array.isArray(content)) continue
+    for (const c of content) {
+      if (c?.type !== 'tool_use') continue
+      const server = mcpServerOf(c.name)
+      if (!server) continue
+      calls.push({ server, tool: c.name, at: Date.parse(r.timestamp) || Date.now() })
+    }
+  }
+  return { calls, end: range.end }
+}
+
+/**
+ * MCP tool calls made since the last scan, across every thread that has a transcript — its
+ * own, and any subagent it has out. Reads only the bytes appended since each file's watermark
+ * — never a whole file — so this costs nothing on a quiet colony and stays cheap on a busy
+ * one. A subagent's calls are reported under its parent's id: there is no separate zone for an
+ * errand to light up, so the beam belongs to whoever sent it.
+ */
+async function scanMcpCalls(threads) {
+  const calls = []
+  const seenSubagentFiles = new Set()
+  for (const t of threads) {
+    if (!t.transcriptFile || !t.cliSessionId) continue
+    const start = mcpWatermark.get(t.cliSessionId)
+    if (start === undefined) {
+      mcpWatermark.set(t.cliSessionId, t.sizeBytes || 0)
+    } else if ((t.sizeBytes || 0) > start) {
+      const result = await mcpCallsSince(t.transcriptFile, start)
+      if (result) {
+        mcpWatermark.set(t.cliSessionId, result.end)
+        for (const c of result.calls) calls.push({ id: t.id, project: t.project, ...c })
+      }
+    }
+
+    // Subagent transcripts live one level below the parent's own file — see `scanSubagents`.
+    // Only a live parent can still be writing one, so a finished thread's errands are not
+    // worth a directory listing every poll; whatever they called was already caught while
+    // they were still running.
+    if (!t.hasLiveProcess) continue
+    const subagentDir = path.join(path.dirname(t.transcriptFile), t.cliSessionId, 'subagents')
+    for (const file of await listFiles(subagentDir, (n) => n.endsWith('.jsonl'))) {
+      seenSubagentFiles.add(file)
+      let stat
+      try {
+        stat = await fsp.stat(file)
+      } catch {
+        continue
+      }
+      const subStart = mcpSubagentWatermark.get(file)
+      if (subStart === undefined) {
+        mcpSubagentWatermark.set(file, stat.size)
+        continue
+      }
+      if (stat.size <= subStart) continue
+      const result = await mcpCallsSince(file, subStart)
+      if (!result) continue
+      mcpSubagentWatermark.set(file, result.end)
+      for (const c of result.calls) calls.push({ id: t.id, project: t.project, ...c })
+    }
+  }
+  // Subagent files are short-lived, so their watermarks are pruned to what this pass actually
+  // found rather than left to grow for the life of the process.
+  for (const file of mcpSubagentWatermark.keys()) {
+    if (!seenSubagentFiles.has(file)) mcpSubagentWatermark.delete(file)
+  }
+  return calls
+}
+
+/**
+ * Month-to-date spend per transcript, kept incremental once a thread has been scanned once.
+ *
+ * A byte watermark alone (as `scanMcpCalls` uses) is not enough here: on first sight of a
+ * thread — or the moment the calendar turns over — the number that matters is the *whole*
+ * month's spend so far, not "spend from here on," so those two cases pay for one full parse
+ * of the transcript. Every poll after that is cheap: only the bytes appended since the last
+ * look are read and added to the running total.
+ */
+const usageCache = new Map()
+
+const monthKeyOf = (d = new Date()) => `${d.getFullYear()}-${d.getMonth()}`
+const startOfMonthMs = (d = new Date()) => new Date(d.getFullYear(), d.getMonth(), 1).getTime()
+
+/**
+ * The CLI writes some assistant turns to the transcript twice — the same `message.id` and
+ * `requestId`, seen back to back a fraction of a second apart, evidently a streaming record
+ * and a finalized one rather than two distinct turns. Counting both roughly tripled the
+ * estimate against `ccusage`'s own numbers on a real transcript, which is what this dedupe
+ * is for: `seen` is one thread's running memory of every id it has already priced, kept
+ * alongside its running total so a later incremental read still catches a duplicate even if
+ * the two copies land in different polls.
+ */
+function costOfRecord(r, seen) {
+  if (r.type !== 'assistant') return 0
+  const id = r.message?.id
+  const key = id ? `${id}:${r.requestId || ''}` : null
+  if (key) {
+    if (seen.has(key)) return 0
+    seen.add(key)
+  }
+  return estimateCost(r.message?.usage, r.message?.model)
+}
+
+/**
+ * `{ totalUsd, deltaUsd }` for one transcript: the month's running total, and how much of it
+ * was added just now — `deltaUsd` is what tells the client a spend *just happened* here,
+ * versus this simply being the first time the total was reported. A full (re)scan reports
+ * a zero delta on purpose: it is catching a number up to where it already was, not a new
+ * spend event to animate.
+ */
+async function threadUsage(entry) {
+  const month = monthKeyOf()
+  const cached = usageCache.get(entry.id)
+  if (cached && cached.month === month && cached.mtime === entry.mtime) {
+    return { totalUsd: cached.totalUsd, deltaUsd: 0 }
+  }
+
+  if (cached && cached.month === month && entry.size >= cached.scannedBytes) {
+    let range
+    try {
+      range = await readRange(entry.file, cached.scannedBytes)
+    } catch {
+      return { totalUsd: cached.totalUsd, deltaUsd: 0 }
+    }
+    let added = 0
+    for (const r of jsonLines(range.text)) added += costOfRecord(r, cached.seen)
+    const totalUsd = cached.totalUsd + added
+    usageCache.set(entry.id, { mtime: entry.mtime, month, totalUsd, scannedBytes: range.end, seen: cached.seen })
+    return { totalUsd, deltaUsd: added }
+  }
+
+  // New thread, a new month, or a file that shrank/rotated out from under its cached size.
+  let text
+  try {
+    text = await fsp.readFile(entry.file, 'utf8')
+  } catch {
+    return { totalUsd: 0, deltaUsd: 0 }
+  }
+  const monthStart = startOfMonthMs()
+  const seen = new Set()
+  let totalUsd = 0
+  for (const r of jsonLines(text)) {
+    const t = Date.parse(r.timestamp || '')
+    if (!Number.isFinite(t) || t < monthStart) continue
+    totalUsd += costOfRecord(r, seen)
+  }
+  usageCache.set(entry.id, { mtime: entry.mtime, month, totalUsd, scannedBytes: entry.size, seen })
+  return { totalUsd, deltaUsd: 0 }
+}
+
+/**
+ * Estimated spend across every transcript this harness can see — machine-wide, not scoped to
+ * whichever repos happen to be on this colony's map, since the canister stands for the whole
+ * plan, not one project's slice of it. `deltas` are per-thread, for the client to animate a
+ * spend event on whichever agent it belongs to (and to silently drop if that thread's project
+ * is not part of this colony at all).
+ */
+export async function scanUsage() {
+  const transcripts = await scanTranscripts()
+  let spendThisMonth = 0
+  const deltas = []
+  for (const [id, entry] of transcripts) {
+    const { totalUsd, deltaUsd } = await threadUsage(entry)
+    spendThisMonth += totalUsd
+    if (deltaUsd > 0) deltas.push({ id: ID(id), usd: deltaUsd })
+  }
+  return { spendThisMonth, deltas }
+}
+
 /** Transcript metadata is expensive to parse, so keep it until the file changes. */
 const metaCache = new Map()
 async function transcriptMeta(entry) {
@@ -267,21 +538,128 @@ async function scanLiveSessions() {
   return live
 }
 
-/** Every thread the desktop app has a record for. */
+/**
+ * Sessions the permission-prompt hook has marked as sitting at a prompt right now. A stale
+ * marker left behind by a session that crashed before its hook could clean up would wrongly
+ * pin a thread as blocked forever, so a marker older than a live prompt could plausibly stay
+ * open is dropped rather than trusted.
+ */
+const BLOCKED_MARKER_MAX_AGE_MS = 60 * 60 * 1000
+async function scanBlockedSessions() {
+  const blocked = new Set()
+  for (const file of await listFiles(BLOCKED_DIR, (n) => n.endsWith('.json'))) {
+    let record
+    try {
+      record = JSON.parse(await fsp.readFile(file, 'utf8'))
+    } catch {
+      continue
+    }
+    if (!record.sessionId) continue
+    if (Date.now() - (num(record.at) || 0) > BLOCKED_MARKER_MAX_AGE_MS) continue
+    blocked.add(record.sessionId)
+  }
+  return blocked
+}
+
+/** Briefs, kept until the file changes — the mtime cache `transcriptMeta` establishes. */
+const subagentCache = new Map()
+
+/** The prompt a parent handed its subagent, which is the only thing about an errand worth showing. */
+async function subagentTask(file, mtime) {
+  const cached = subagentCache.get(file)
+  if (cached && cached.mtime === mtime) return cached.task
+  let task = ''
+  // Not simply the first record, and sometimes not there at all: a forked subagent opens with a
+  // `fork-context-ref` and inherits its parent's context instead of being briefed, so it has no
+  // task text to find. Same test `readTranscriptMeta` puts to a thread's first prompt.
+  for (const record of jsonLines(await readHead(file, SUBAGENT_HEAD_BYTES).catch(() => ''))) {
+    if (record.type !== 'user' || !record.message) continue
+    const text = cleanPrompt(firstText(record.message.content))
+    if (text && !text.startsWith('<')) {
+      task = text
+      break
+    }
+  }
+  subagentCache.set(file, { mtime, task })
+  return task
+}
+
+/**
+ * The subagents a session has out right now, keyed by the session that sent them. Their
+ * transcripts live one level below the session's own, in
+ * `<project>/<sessionId>/subagents/agent-<id>.jsonl`.
+ *
+ * Only sessions with a live process are walked. Every other session on disk has subagent
+ * transcripts too, and all of that work would be thrown away: an errand cannot outlive the
+ * process running it.
+ */
+async function scanSubagents(livePending) {
+  const byParent = new Map()
+  const live = await livePending
+  if (!live.size) return byParent
+  const seen = new Set()
+  const cutoff = Date.now() - SUBAGENT_WINDOW_MS
+  for (const projectDir of await listDirs(CLI_PROJECTS)) {
+    for (const sessionDir of await listDirs(projectDir)) {
+      const parent = path.basename(sessionDir)
+      if (!live.has(parent)) continue
+      const dir = path.join(sessionDir, 'subagents')
+      for (const file of await listFiles(dir, (n) => n.endsWith('.jsonl'))) {
+        const stat = await fsp.stat(file).catch(() => null)
+        if (!stat || stat.mtimeMs < cutoff) continue
+        // A subagent that has handed its answer back is finished however recently it wrote —
+        // the same question `awaitingReply` asks of a thread, put to the errand's own transcript.
+        seen.add(file)
+        if (await awaitingReply(file)) continue
+        const out = byParent.get(parent) || []
+        out.push({
+          id: path.basename(file, '.jsonl'),
+          task: await subagentTask(file, stat.mtimeMs),
+          lastActivityAt: stat.mtimeMs,
+        })
+        byParent.set(parent, out)
+      }
+    }
+  }
+  // Errands are many and short-lived, so the cache is pruned to what this pass actually saw
+  // rather than growing for the life of the process the way the thread cache can afford to.
+  for (const file of subagentCache.keys()) {
+    if (!seen.has(file)) subagentCache.delete(file)
+  }
+  return byParent
+}
+
+/**
+ * What deleting a thread in the desktop app leaves behind, in the folder its record was in:
+ * `deleted_<cliSessionId>`, holding the deletion time in epoch ms. The record goes; the CLI
+ * transcript does not. Without the marker that transcript is indistinguishable from a thread
+ * started in a terminal, so a thread you had got rid of walked straight back onto the map as one.
+ */
+const DELETED_MARKER = /^deleted_(.+)$/
+const isRecord = (name) => name.startsWith('local_') && name.endsWith('.json')
+
+/** Every thread the desktop app has a record for, and the ids of the ones it has deleted. */
 async function scanDesktopSessions() {
-  const out = []
+  const records = []
+  const deleted = new Set()
   for (const account of await listDirs(DESKTOP_SESSIONS)) {
     for (const org of await listDirs(account)) {
-      for (const file of await listFiles(org, (n) => n.startsWith('local_') && n.endsWith('.json'))) {
+      for (const file of await listFiles(org, (n) => isRecord(n) || DELETED_MARKER.test(n))) {
+        const marker = DELETED_MARKER.exec(path.basename(file))
+        if (marker) {
+          // Only the name is read. When it was deleted is not something the map shows.
+          if (isCliId(marker[1])) deleted.add(marker[1])
+          continue
+        }
         try {
-          out.push(JSON.parse(await fsp.readFile(file, 'utf8')))
+          records.push(JSON.parse(await fsp.readFile(file, 'utf8')))
         } catch {
           /* a session mid-write — skip this pass */
         }
       }
     }
   }
-  return out
+  return { records, deleted }
 }
 
 /**
@@ -340,10 +718,15 @@ function toThread(t) {
 }
 
 async function scanThreads() {
-  const [desktop, transcripts, live] = await Promise.all([
+  // The subagent walk needs the live set, and waiting for it here would serialise scans the
+  // README says must never block — so it is handed the promise and waits on it itself.
+  const livePending = scanLiveSessions()
+  const [{ records: desktop, deleted }, transcripts, live, subagents, blockedSessions] = await Promise.all([
     scanDesktopSessions(),
     scanTranscripts(),
-    scanLiveSessions(),
+    livePending,
+    scanSubagents(livePending),
+    scanBlockedSessions(),
   ])
   const byId = new Map()
   const add = (thread) => {
@@ -403,7 +786,8 @@ async function scanThreads() {
     })
   }
 
-  // Transcripts with no desktop record — usually threads started straight from the terminal.
+  // Transcripts with no desktop record — threads started straight from the terminal, and threads
+  // the app has since deleted.
   for (const [id, entry] of transcripts) {
     if (claimed.has(id)) continue
     const meta = await transcriptMeta(entry)
@@ -433,7 +817,13 @@ async function scanThreads() {
       starred: false,
       routine: '',
       prState: '',
-      archived: false,
+      // Deleted in the app, and reported the way an archive made there is. `archived` is the
+      // read-only field an adapter has for "gone from the harness's own UI", and the colony sends
+      // the astronaut home for it exactly as it does for an archive of its own — rather than the
+      // thread simply vanishing from one scan to the next. Only a transcript with no record left
+      // qualifies: resuming a deleted thread makes the app write a fresh record while the marker
+      // stays behind, and a record that exists is the newer truth.
+      archived: deleted.has(id),
       hasTranscript: true,
       sizeBytes: entry.size,
       transcriptFile: entry?.file || '',
@@ -472,32 +862,78 @@ async function scanThreads() {
     const fresh = now - thread.lastActivityAt < ACTIVE_WINDOW_MS
     const waiting =
       thread.hasLiveProcess && fresh && thread.transcriptFile ? await awaitingReply(thread.transcriptFile) : false
-    thread.running = thread.hasLiveProcess && fresh && !waiting
+    const blocked = blockedSessions.has(thread.cliSessionId)
+    thread.running = thread.hasLiveProcess && fresh && !waiting && !blocked
+    thread.blocked = blocked
     // A thread that handed the turn back wants you, whether or not the desktop app has ever seen
-    // it — the only way a terminal-only thread can ask for anything at all.
-    if (waiting) thread.unread = true
+    // it — the only way a terminal-only thread can ask for anything at all. A permission prompt
+    // wants you the same way.
+    if (waiting || blocked) thread.unread = true
+    const errands = subagents.get(thread.cliSessionId)
+    if (errands) thread.subagents = errands
   }
+
+  // Which MCP tools got called since the last scan, grouped back onto the thread that made
+  // the call — additive on top of the fields above, so a harness that never sets it (or a
+  // future one that does not implement this at all) just leaves every thread's list empty.
+  const mcpCalls = await scanMcpCalls(threads)
+  const callsByThread = new Map()
+  for (const call of mcpCalls) {
+    if (!callsByThread.has(call.id)) callsByThread.set(call.id, [])
+    callsByThread.get(call.id).push(call)
+  }
+  for (const thread of threads) thread.mcpCalls = callsByThread.get(thread.id) || []
+
   return threads.map(toThread)
 }
 
 /**
  * Where the `claude` CLI is, for a machine that has it but no desktop app to answer the deep
- * link. PATH first, then the places its installers put it — never inside an application bundle.
- * Only Linux asks: on macOS and Windows the deep link is always answered, so the walk is wasted.
+ * link, or a page that would rather have a terminal. PATH first, then the places its installers
+ * put it — never inside an application bundle.
  */
 const CLI_DIRS = [
   path.join(HOME, '.local', 'bin'),
   path.join(HOME, '.claude', 'local'),
+  '/opt/homebrew/bin',
   '/usr/local/bin',
   '/usr/bin',
 ]
 const cliBinary = () => findExecutable('claude', CLI_DIRS)
 
 /**
+ * The pid of the live CLI process behind a session, if any. Same registry and same caveat as
+ * `scanLiveSessions`: files outlive their pids, so the pid is probed before it counts.
+ */
+async function liveSessionPid(sessionId) {
+  for (const file of await listFiles(CLI_LIVE, (n) => n.endsWith('.json'))) {
+    let record
+    try {
+      record = JSON.parse(await fsp.readFile(file, 'utf8'))
+    } catch {
+      continue
+    }
+    if (record.sessionId !== sessionId || !record.pid) continue
+    try {
+      process.kill(record.pid, 0)
+      return record.pid
+    } catch {
+      /* process is gone */
+    }
+  }
+  return 0
+}
+
+/**
  * Hands the thread back to Claude Code. `epitaxy/<local_…>` *navigates* the desktop app
  * to a thread it already has; `resume` *imports* the transcript, which spawns a second
  * untitled session and rewrites the .jsonl — so it is only ever the fallback for threads
  * the app has never seen. Ids are pattern-checked before they reach the opener.
+ *
+ * A terminal-started thread that is still running gets its live pid handed along too: it
+ * already has a window somewhere on this machine, and fronting that window is a better answer
+ * than `resume` importing the transcript into the desktop app as a second, untitled session.
+ * Whether and how to front it is the server's call — see `server/lib/windows.mjs`.
  */
 async function openThread(ref) {
   const { desktopSessionId, cliSessionId, cwd } = ref || {}
@@ -505,14 +941,19 @@ async function openThread(ref) {
   if (isDesktopId(desktopSessionId)) url = `claude://claude.ai/epitaxy/${desktopSessionId}`
   else if (isCliId(cliSessionId)) url = `claude://resume?session=${cliSessionId}`
 
+  // Only threads the desktop app has never seen: for the rest the deep link navigates to the
+  // tab the app already has, which is exactly the right window to front.
+  let pid = 0
+  if (!isDesktopId(desktopSessionId) && isCliId(cliSessionId)) pid = await liveSessionPid(cliSessionId)
+
   let command
-  if (process.platform === 'linux' && isCliId(cliSessionId)) {
+  if (isCliId(cliSessionId)) {
     const bin = await cliBinary()
     if (bin) command = { argv: [bin, '--resume', cliSessionId], cwd: typeof cwd === 'string' ? cwd : '' }
   }
 
   if (!url && !command) return { ok: false, error: 'No openable session id on that thread' }
-  return { ok: true, url, command }
+  return { ok: true, url, command, pid }
 }
 
 /**
@@ -522,11 +963,8 @@ async function openThread(ref) {
  */
 async function newSession(dir) {
   const url = `claude://code/new?${new URLSearchParams({ folder: dir })}`
-  let command
-  if (process.platform === 'linux') {
-    const bin = await cliBinary()
-    if (bin) command = { argv: [bin], cwd: dir }
-  }
+  const bin = await cliBinary()
+  const command = bin ? { argv: [bin], cwd: dir } : undefined
   return { ok: true, url, command }
 }
 
@@ -536,6 +974,7 @@ export default {
   /** Only claim this machine if one of the two stores is actually there. */
   detect: async () => (await exists(DESKTOP_SESSIONS)) || (await exists(CLI_PROJECTS)),
   scanThreads,
+  scanUsage,
   openThread,
   newSession,
   paths: { DESKTOP_SESSIONS, CLI_PROJECTS, CLI_LIVE },
