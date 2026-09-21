@@ -11,6 +11,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { HARNESSES } from '../server/harnesses/index.mjs'
+import { drawHarnessMark, HARNESS_MARKS, harnessMark } from '../src/ui/harness-marks.js'
 import codex from '../server/harnesses/codex.mjs'
 import claudeCode from '../server/harnesses/claude-code.mjs'
 import opencode, { defaultDbFiles, scanDbFile } from '../server/harnesses/opencode.mjs'
@@ -664,4 +665,35 @@ test('Cursor offers a folder link but never a per-thread one it cannot honour', 
   assert.ok(opened.url.includes('%20'), 'a space in the path is escaped, not left raw')
   assert.equal(h.newSession('relative/path').ok, false)
   await fsp.rm(home, { recursive: true, force: true })
+})
+
+// ── HUD card avatars ────────────────────────────────────────────────────────
+
+test('every registered harness resolves to paint layers, or deliberately falls back to the face', () => {
+  for (const h of HARNESSES) {
+    const layers = harnessMark(h.id)
+    if (layers === undefined) continue // documented in harness-marks.js
+    assert.ok(Array.isArray(layers) && layers.length > 0)
+    for (const { d, fill } of layers) {
+      assert.match(d, /^[Mm]/, `${h.id} mark is not path data`)
+      assert.match(fill, /^#([0-9a-f]{3}|[0-9a-f]{6})$/, `${h.id} mark fill is not a colour`)
+    }
+  }
+  // The four we ship artwork for today.
+  for (const id of ['claude-code', 'codex', 'cursor', 'opencode']) {
+    assert.ok(harnessMark(id), `${id} should have a mark`)
+  }
+  // The two-tone mark really is two tones.
+  assert.deepEqual(
+    harnessMark('opencode').map((l) => l.fill),
+    ['#fff', '#8f959e']
+  )
+})
+
+test('refs from the page cannot smuggle a mark lookup, and unknown harnesses keep the face', () => {
+  assert.equal(harnessMark(['claude-code']), undefined)
+  assert.equal(harnessMark({ toString: () => 'claude-code' }), undefined)
+  assert.equal(harnessMark('definitely-not-a-harness'), undefined)
+  assert.equal(harnessMark(null), undefined)
+  assert.equal(drawHarnessMark(null, 'definitely-not-a-harness', 108), false)
 })

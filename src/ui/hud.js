@@ -3,6 +3,7 @@ import { PLANETS } from '../world/planet.js'
 import { TIMES, systemTimeOfDay } from '../world/sky.js'
 import { STATUS_LABEL } from '../game/colony.js'
 import { FACE, FRAME_COLS, FRAME_ROWS } from '../agents/faces.js'
+import { drawHarnessMark, harnessMark } from './harness-marks.js'
 import { PLOT_PALETTE, hashString } from '../world/plots.js'
 
 /**
@@ -344,7 +345,7 @@ export class Hud {
     this.avatarTmp.width = 108
     this.avatarTmp.height = 108
     this.avatarTmpCtx = this.avatarTmp.getContext('2d')
-    this._avatarState = { frame: -1, color: '' }
+    this._avatarState = { frame: -1, color: '', mark: '' }
   }
 
   _wire() {
@@ -683,15 +684,17 @@ export class Hud {
     this._sideWidth = px
   }
 
-  /** Redraw the card's face so it blinks in step with the astronaut it belongs to. */
+  /** The card shows the harness mark when it has one, else the blinking face. */
   updateAvatar(faceAtlasCanvas) {
     if (!this.selected || !faceAtlasCanvas) return
     const agent = this.selected.agent
+    const harness = this.selected.thread?.harness
+    const mark = harnessMark(harness) ? harness : ''
     const frame = agent.faceFrame ?? FACE.idle
     const color = agent.eye
     const css = cssFromGlow(color)
-    if (this._avatarState.frame === frame && this._avatarState.color === css) return
-    this._avatarState = { frame, color: css }
+    if (this._avatarState.frame === frame && this._avatarState.color === css && this._avatarState.mark === mark) return
+    this._avatarState = { frame, color: css, mark }
 
     const size = 108
     const cell = faceAtlasCanvas.width / FRAME_COLS
@@ -701,14 +704,20 @@ export class Hud {
     // The atlas is an opaque white-on-black mask, so the tint is a `multiply`, not a
     // `source-in`: black stays black and the white features take the eye colour. Keying on
     // alpha instead would flood the whole cell, because every pixel in it is opaque.
+    // A harness mark skips the tint and stays white: brand marks have their own
+    // colours in the mind's eye already, and the eye tint is what made them wrong.
     const t = this.avatarTmpCtx
     t.globalCompositeOperation = 'source-over'
     t.clearRect(0, 0, size, size)
-    t.drawImage(faceAtlasCanvas, sx, sy, cell, cell, 0, 0, size, size)
-    t.globalCompositeOperation = 'multiply'
-    t.fillStyle = css
-    t.fillRect(0, 0, size, size)
-    t.globalCompositeOperation = 'source-over'
+    if (mark) {
+      drawHarnessMark(t, mark, size)
+    } else {
+      t.drawImage(faceAtlasCanvas, sx, sy, cell, cell, 0, 0, size, size)
+      t.globalCompositeOperation = 'multiply'
+      t.fillStyle = css
+      t.fillRect(0, 0, size, size)
+      t.globalCompositeOperation = 'source-over'
+    }
 
     const c = this.avatarCtx
     c.fillStyle = '#06070c'
