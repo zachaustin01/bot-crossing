@@ -304,6 +304,29 @@ function hostnameOf(value) {
 }
 
 /**
+ * Extra hostnames the operator trusts, from `BOT_CROSSING_ALLOWED_HOSTS`
+ * (comma-separated, e.g. `colony.lan,192.168.1.10`). Needed when the page is
+ * served under a DNS name — mDNS, split-horizon DNS, reverse proxy — rather
+ * than `localhost` or a bare LAN IP, both of which are already allowed.
+ *
+ * Explicit, never resolved: a name that merely *resolves* to 127.0.0.1 stays
+ * rejected, which is what keeps the DNS-rebinding check meaningful.
+ */
+export function extraAllowedHosts() {
+  const raw = process.env.BOT_CROSSING_ALLOWED_HOSTS || ''
+  return raw
+    .split(',')
+    .map((s) => hostnameOf(s.trim()).toLowerCase())
+    .filter(Boolean)
+}
+
+function isAllowedHost(name) {
+  const n = String(name || '').toLowerCase()
+  if (LOCAL_HOSTS.has(n)) return true
+  return extraAllowedHosts().includes(n)
+}
+
+/**
  * Only a page this server itself served may drive it. Two checks, against two different
  * attacks, both of which a localhost server with an `open`-the-desktop-app button is a
  * genuinely attractive target for:
@@ -321,10 +344,10 @@ function hostnameOf(value) {
  * POST is rejected; pass `-H 'Origin: http://localhost:5274'` if you are scripting this.
  */
 function isLocalRequest(req) {
-  if (!LOCAL_HOSTS.has(hostnameOf(req.headers.host))) return false
+  if (!isAllowedHost(hostnameOf(req.headers.host))) return false
 
   const origin = req.headers.origin
-  if (origin && origin !== 'null') return LOCAL_HOSTS.has(hostnameOf(origin))
+  if (origin && origin !== 'null') return isAllowedHost(hostnameOf(origin))
   return req.method === 'GET' || req.method === 'HEAD'
 }
 

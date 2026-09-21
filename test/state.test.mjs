@@ -135,6 +135,43 @@ test('a cross-origin write is refused even though the host is local', async () =
   })
 })
 
+test('a hostname in BOT_CROSSING_ALLOWED_HOSTS is accepted as Host and Origin', async () => {
+  const prev = process.env.BOT_CROSSING_ALLOWED_HOSTS
+  process.env.BOT_CROSSING_ALLOWED_HOSTS = 'colony.example'
+  try {
+    await withServer(async ({ call }) => {
+      void call
+      const dir2 = process.env.BOT_CROSSING_DATA
+      const { apiMiddleware: fresh } = await import(`../server/api.mjs?allowed-${Date.now()}`)
+      void dir2
+      const srv = http.createServer((req, res) => fresh(req, res, null))
+      await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+      const port = srv.address().port
+      try {
+        const statusOf = (host, origin) =>
+          new Promise((resolve, reject) => {
+            const req = http.request(
+              { host: '127.0.0.1', port, path: '/api/state', method: 'GET', headers: { Host: host, Origin: origin } },
+              (res) => {
+                res.resume()
+                res.on('end', () => resolve(res.statusCode))
+              }
+            )
+            req.on('error', reject)
+            req.end()
+          })
+        assert.equal(await statusOf('colony.example', 'http://colony.example'), 200)
+        assert.equal(await statusOf('evil.com', 'http://evil.com'), 403)
+      } finally {
+        srv.close()
+      }
+    })
+  } finally {
+    if (prev === undefined) delete process.env.BOT_CROSSING_ALLOWED_HOSTS
+    else process.env.BOT_CROSSING_ALLOWED_HOSTS = prev
+  }
+})
+
 // ── marking a thread viewed ───────────────────────────────────────────────────
 
 /**
