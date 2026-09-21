@@ -500,6 +500,28 @@ test('opencode marks a fresh running tool call as working', async () => {
   }
 })
 
+test('opencode keeps a session working briefly after its tool completes', async () => {
+  const now = Date.now()
+  const recent = await fakeOpencodeFull([sesRow('ses_gap00000000000000000001', now - 30000)], {
+    parts: [['p1', 'm1', 'ses_gap00000000000000000001', now - 40000, now - 30000, toolPart('bash', 'completed')]],
+  })
+  const quiet = await fakeOpencodeFull([sesRow('ses_gap00000000000000000002', now - 600000)], {
+    parts: [['p1', 'm1', 'ses_gap00000000000000000002', now - 620000, now - 600000, toolPart('bash', 'completed')]],
+  })
+  try {
+    const [working] = await (await opencodeWith(recent)).scanThreads()
+    assert.equal(working.running, true, 'a tool finished seconds ago is still the turn in motion')
+    assert.equal(working.unread, false)
+    delete process.env.BOT_CROSSING_OPENCODE_DB
+    const [idle] = await (await opencodeWith(quiet)).scanThreads()
+    assert.equal(idle.running, false, 'a tool finished minutes ago is rest, not work')
+  } finally {
+    delete process.env.BOT_CROSSING_OPENCODE_DB
+    await fsp.rm(path.dirname(recent), { recursive: true, force: true })
+    await fsp.rm(path.dirname(quiet), { recursive: true, force: true })
+  }
+})
+
 test('opencode does not resurrect fossil parts from dead servers', async () => {
   const now = Date.now()
   const old = now - 6 * 60 * 60 * 1000

@@ -119,6 +119,12 @@ const ACTIVE_WINDOW_MS = 30 * 60 * 1000
  */
 const QUESTION_GRACE_MS = 90 * 1000
 const TOOL_PARKED_GRACE_MS = 3 * 60 * 1000
+/**
+ * How long a finished tool call still counts as the turn in motion. Without
+ * this the astronaut drops to idle in the gap between one tool completing and
+ * the next starting — mid-task sessions flicker working/idle every poll.
+ */
+const WORKING_GRACE_MS = 2 * 60 * 1000
 const LONG_TOOL_PARKED_GRACE_MS = 15 * 60 * 1000
 const LONG_TOOLS = new Set(['bash', 'task'])
 /**
@@ -143,7 +149,7 @@ const TEXT_SETTLED_MS = 60 * 1000
  */
 function turnStates(db, tables, now) {
   const out = new Map()
-  const blank = () => ({ parked: 0, active: 0, endsWithQuestion: false, questionAt: 0, errorAt: 0, progressAt: 0, errorTimed: true, lastRole: '' })
+  const blank = () => ({ parked: 0, active: 0, endsWithQuestion: false, questionAt: 0, errorAt: 0, progressAt: 0, workAt: 0, errorTimed: true, lastRole: '' })
   const cutoff = now - ACTIVE_WINDOW_MS
   if (tables.has('part')) {
     try {
@@ -204,7 +210,11 @@ function turnStates(db, tables, now) {
                 AND json_extract(data,'$.state.status') = 'error' THEN time_updated ELSE 0 END) AS error_at,
               MAX(CASE WHEN json_extract(data,'$.type') = 'tool'
                 AND json_extract(data,'$.state.status') IN ('completed','running','pending')
-                THEN time_updated ELSE 0 END) AS progress_at
+                THEN time_updated ELSE 0 END) AS progress_at,
+              MAX(CASE WHEN json_extract(data,'$.type') = 'tool'
+                AND json_extract(data,'$.state.status') IN ('completed','running','pending')
+                AND json_extract(data,'$.tool') != 'question'
+                THEN time_updated ELSE 0 END) AS work_at
             FROM part GROUP BY session_id`
           )
           .all()
@@ -213,6 +223,7 @@ function turnStates(db, tables, now) {
           const entry = out.get(r.session_id) ?? blank()
           entry.errorAt = num(r.error_at)
           entry.progressAt = num(r.progress_at)
+          entry.workAt = num(r.work_at)
           entry.errorTimed = true
           out.set(r.session_id, entry)
         }
@@ -230,6 +241,7 @@ function turnStates(db, tables, now) {
           const entry = out.get(r.session_id) ?? blank()
           entry.errorAt = num(r.error_at)
           entry.progressAt = 0
+          entry.workAt = 0
           entry.errorTimed = false
           out.set(r.session_id, entry)
         }
@@ -346,12 +358,17 @@ export async function scanDbFile(dbFile) {
       // while it is the latest tool outcome — newer completed work means the
       // turn recovered. Archived threads are home regardless of what their
       // tail says.
-      const turn = turns.get(row.id) ?? { parked: 0, active: 0, endsWithQuestion: false, questionAt: 0, errorAt: 0, progressAt: 0, errorTimed: true, lastRole: '' }
+      const turn = turns.get(row.id) ?? { parked: 0, active: 0, endsWithQuestion: false, questionAt: 0, errorAt: 0, progressAt: 0, workAt: 0, errorTimed: true, lastRole: '' }
       const fresh = now - num(row.time_updated) < ACTIVE_WINDOW_MS
       const archived = row.time_archived != null
       const asked = turn.endsWithQuestion && turn.active === 0 && turn.lastRole === 'assistant' && now - turn.questionAt > TEXT_SETTLED_MS
       const waiting = !archived && fresh && (turn.parked > 0 || asked)
-      const running = !archived && fresh && !waiting && (turn.active > 0 || turn.lastRole === 'user')
+      // A tool finished seconds ago is still the turn in motion — the next
+      // call (or the verdict on this one) has simply not landed yet. A
+      // completed `question` is settled asking, not work, so it is tracked
+      // separately and excluded here.
+      const recentWork = now - turn.workAt < WORKING_GRACE_MS
+      const running = !archived && fresh && !waiting && (turn.active > 0 || turn.lastRole === 'user' || recentWork)
       const errored = turn.errorTimed
         ? turn.errorAt > turn.progressAt && turn.errorAt > cutoff
         : turn.errorAt > 0
