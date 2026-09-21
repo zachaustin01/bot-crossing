@@ -67,7 +67,7 @@ export const PRESETS = {
       textureQuality: 'medium',
       scatterDensity: 0.6,
       groundDetail: 'medium',
-      maxAgents: 90,
+      maxAgents: 100,
       stars: true,
       ibl: true,
       tiltShift: true,
