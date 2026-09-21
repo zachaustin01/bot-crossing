@@ -1061,7 +1061,9 @@ body {
   right: 15px;
   top: 48px;
   z-index: 30;
-  background: var(--panel);
+  /* Solid, not the translucent panel: a menu floating over the 3D scene needs to
+     stay legible, and every other panel sits over dimmed chrome instead. */
+  background: var(--panel-solid);
   border: 1px solid var(--line);
   border-radius: 10px;
   box-shadow: var(--shadow);

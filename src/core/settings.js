@@ -142,7 +142,7 @@ const PARTICLE_BUDGET = { off: 0, low: 900, full: 3000 }
  */
 export const MAX_AGENT_CAP = Math.max(...Object.values(PRESETS).map((p) => p.values.maxAgents || 0))
 
-const DEFAULTS = {
+export const DEFAULTS = {
   preset: 'balanced',
   ...PRESETS.balanced.values,
 
@@ -203,6 +203,10 @@ const DEFAULTS = {
   showFps: false,
   showLabels: true,
   reducedMotion: false,
+  // The thread card paints the harness brand mark instead of the blinking face.
+  // On, because that is the shipped look — and the mark now carries a status ring,
+  // so opting out is about taste rather than losing the at-a-glance state.
+  harnessMarks: true,
 
   // Opening
   openIn: 'app', // 'app' | 'terminal' — the harness's desktop app, or its CLI in a new window

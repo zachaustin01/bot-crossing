@@ -14,7 +14,8 @@ import antigravity from '../server/harnesses/antigravity.mjs'
 import opencode, { defaultDbFiles } from '../server/harnesses/opencode.mjs'
 
 import { HARNESSES } from '../server/harnesses/index.mjs'
-import { drawHarnessMark, HARNESS_MARKS, harnessMark } from '../src/ui/harness-marks.js'
+import { avatarMode, drawHarnessMark, HARNESS_MARKS, harnessMark } from '../src/ui/harness-marks.js'
+import { DEFAULTS } from '../src/core/settings.js'
 import codex from '../server/harnesses/codex.mjs'
 import claudeCode from '../server/harnesses/claude-code.mjs'
 import { readTail, findExecutable } from '../server/lib/fsutil.mjs'
@@ -1031,4 +1032,17 @@ test('refs from the page cannot smuggle a mark lookup, and unknown harnesses kee
   assert.equal(harnessMark('definitely-not-a-harness'), undefined)
   assert.equal(harnessMark(null), undefined)
   assert.equal(drawHarnessMark(null, 'definitely-not-a-harness', 108), false)
+})
+
+test('brand marks are on by default and stay out of presets', () => {
+  assert.equal(DEFAULTS.harnessMarks, true)
+})
+
+test('the avatar decision honours the toggle and never blanks the card', () => {
+  assert.equal(avatarMode(true, 'claude-code'), 'mark')
+  assert.equal(avatarMode(true, 'opencode'), 'mark')
+  assert.equal(avatarMode(false, 'claude-code'), 'face')
+  assert.equal(avatarMode(true, 'definitely-not-a-harness'), 'face')
+  assert.equal(avatarMode(true, null), 'face')
+  assert.equal(avatarMode(false, null), 'face')
 })

@@ -3,7 +3,7 @@ import { PLANETS } from '../world/planet.js'
 import { TIMES, systemTimeOfDay } from '../world/sky.js'
 import { STATUS_LABEL } from '../game/colony.js'
 import { FACE, FRAME_COLS, FRAME_ROWS } from '../agents/faces.js'
-import { drawHarnessMark, harnessMark } from './harness-marks.js'
+import { avatarMode, drawHarnessMark } from './harness-marks.js'
 import { PLOT_PALETTE, hashString } from '../world/plots.js'
 
 /**
@@ -273,6 +273,7 @@ export class Hud {
       this._toggle('Return to isometric', 'autoFrame', 'Eases the angle back when you stop dragging.'),
       this._slider('Field of view', 'fov', 20, 60, 1, (v) => `${v}°`),
       this._toggle('Project labels', 'showLabels'),
+      this._toggle('Harness brand marks', 'harnessMarks', 'The thread card paints the harness brand mark instead of the blinking face. The mark keeps a status-coloured ring, so this is taste rather than signal.'),
       this._toggle('Reduced motion', 'reducedMotion', 'Calms the bobbing and the camera easing.'),
       this._toggle('Show FPS', 'showFps'),
       this._toggle('MCP switchboard', 'mcpSwitchboard', 'The relay tower that beams a plot — and glows its border — when a thread calls an MCP tool.'),
@@ -849,12 +850,17 @@ export class Hud {
     this.actions.viewportChanged?.({ width, height, right, bottom })
   }
 
-  /** The card shows the harness mark when it has one, else the blinking face. */
+  /**
+   * The card paints the harness mark when the toggle is on and one exists, else the
+   * blinking face. The mark stays white and untinted — brand colours read as brand —
+   * and carries the live eye colour as a bezel ring instead, so status stays
+   * pre-attentive without repainting somebody else's logo.
+   */
   updateAvatar(faceAtlasCanvas) {
     if (!this.selected || !faceAtlasCanvas) return
     const agent = this.selected.agent
     const harness = this.selected.thread?.harness
-    const mark = harnessMark(harness) ? harness : ''
+    const mark = avatarMode(this.settings.get('harnessMarks'), harness) === 'mark' ? harness : ''
     const frame = agent.faceFrame ?? FACE.idle
     const color = agent.eye
     const css = cssFromGlow(color)
@@ -869,13 +875,18 @@ export class Hud {
     // The atlas is an opaque white-on-black mask, so the tint is a `multiply`, not a
     // `source-in`: black stays black and the white features take the eye colour. Keying on
     // alpha instead would flood the whole cell, because every pixel in it is opaque.
-    // A harness mark skips the tint and stays white: brand marks have their own
-    // colours in the mind's eye already, and the eye tint is what made them wrong.
     const t = this.avatarTmpCtx
     t.globalCompositeOperation = 'source-over'
     t.clearRect(0, 0, size, size)
     if (mark) {
       drawHarnessMark(t, mark, size)
+      // Status bezel, inside the cell edge: thick enough to read at a glance, thin
+      // enough to leave the mark alone. Tinted marks were tried and rejected — the
+      // eye colour is what made brand silhouettes read wrong.
+      const ring = 9
+      t.strokeStyle = css
+      t.lineWidth = ring
+      t.strokeRect(ring / 2 + 1, ring / 2 + 1, size - ring - 2, size - ring - 2)
     } else {
       t.drawImage(faceAtlasCanvas, sx, sy, cell, cell, 0, 0, size, size)
       t.globalCompositeOperation = 'multiply'

@@ -54,6 +54,15 @@ export const HARNESS_MARKS = {
 export const harnessMark = (harnessId) =>
   typeof harnessId === 'string' ? HARNESS_MARKS[harnessId] : undefined
 
+/**
+ * Which avatar the thread card paints: the harness brand mark, or the blinking
+ * status-tinted face. Marks are opt-out (`harnessMarks` in settings); a harness
+ * with no artwork always keeps the face — never a blank card.
+ */
+export function avatarMode(marksOn, harnessId) {
+  return marksOn && harnessMark(harnessId) ? 'mark' : 'face'
+}
+
 const VIEWBOX = 24
 
 /**
