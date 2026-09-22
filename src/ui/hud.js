@@ -440,6 +440,7 @@ export class Hud {
     on('#btn-open', 'click', () => this.actions.openThread?.())
     on('#btn-viewed', 'click', () => this.actions.markViewed?.())
     on('#btn-archive', 'click', () => this.actions.archiveThread?.())
+    on('.thread-pop .title', 'dblclick', () => this.startRename())
     on('#btn-deselect', 'click', () => this.actions.select?.(null))
     on('#btn-follow', 'click', () => this.settings.set('followSelected', !this.settings.get('followSelected')))
     on('#btn-new-session', 'click', () => this.actions.newConversation?.())
@@ -671,6 +672,9 @@ export class Hud {
     const card = this.$('.thread-pop')
     // Only ever one accent button in the panel: whichever action is the immediate one.
     this.$('#btn-new-session').classList.toggle('primary', !agent || !thread)
+    // A rename in progress survives a poll repainting its own card; anything else ends it.
+    const renaming = this._rename && thread && this._rename.id === thread.id
+    if (this._rename && !renaming) this._rename.finish(false)
     if (!agent || !thread) {
       card.classList.remove('on')
       this.selected = null
@@ -681,7 +685,7 @@ export class Hud {
     // On a phone the card docks above the sheet's peek, so the sheet drops to make room.
     if (this.isPhone()) this.toggleSheet(false)
 
-    this.$('.thread-pop .title').textContent = thread.title || 'Untitled thread'
+    if (!renaming) this.$('.thread-pop .title').textContent = thread.title || 'Untitled thread'
     const status = STATUS_LABEL[agent.status] || agent.status
     const meta = this.$('.thread-pop .meta')
     const bits = [
@@ -708,6 +712,41 @@ export class Hud {
     // crowd the two that are always worth having, and "Viewed" on a thread that is not asking
     // for anything is a control with no effect.
     this.$('#btn-viewed').hidden = !thread.unread
+  }
+
+  /**
+   * Swap the card's title for a field. Enter or clicking away keeps it, Esc throws it away,
+   * and an empty field hands the thread back its harness's own title.
+   */
+  startRename() {
+    if (!this.selected || this._rename) return
+    const { thread } = this.selected
+    const title = this.$('.thread-pop .title')
+    const input = document.createElement('input')
+    input.className = 'rename'
+    input.value = thread.title || ''
+    input.placeholder = thread.originalTitle ?? (thread.title || 'Untitled thread')
+    input.maxLength = 120
+    input.spellcheck = false
+    input.setAttribute('aria-label', 'Rename this bot')
+
+    const finish = (keep) => {
+      if (this._rename?.input !== input) return
+      this._rename = null
+      title.textContent = thread.title || 'Untitled thread'
+      if (keep) this.actions.renameThread?.(thread.id, input.value)
+    }
+    this._rename = { id: thread.id, input, finish }
+    input.addEventListener('keydown', (e) => {
+      // Kept inside the field: the page's own Esc would deselect the bot underneath it.
+      e.stopPropagation()
+      if (e.key === 'Enter') finish(true)
+      else if (e.key === 'Escape') finish(false)
+    })
+    input.addEventListener('blur', () => finish(true))
+    title.replaceChildren(input)
+    input.focus()
+    input.select()
   }
 
   /**
@@ -1154,6 +1193,7 @@ const TEMPLATE = `
         <div class="k"><span>Next needing you</span><kbd>N</kbd></div>
         <div class="k"><span>Open thread</span><kbd>Enter</kbd></div>
         <div class="k"><span>Mark viewed</span><kbd>V</kbd></div>
+        <div class="k"><span>Rename</span><kbd>R</kbd></div>
         <div class="k"><span>Archive</span><kbd>A</kbd></div>
         <div class="k"><span>New conversation</span><kbd>C</kbd></div>
         <div class="k"><span>Orbit mode</span><kbd>O</kbd></div>

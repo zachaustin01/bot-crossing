@@ -38,6 +38,7 @@ function migrate(raw) {
     opened: asArray(raw.opened).map(migrateId),
     seen: keys(raw.seen),
     viewedAt: keys(raw.viewedAt),
+    names: keys(raw.names),
   }
 }
 
@@ -56,12 +57,20 @@ const emptyState = () => ({
   seen: {},
   hiddenProjects: [],
   viewedAt: {},
+  names: {},
   settings: null,
   updatedAt: 0,
 })
 
 const asObject = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {})
 const asArray = (v) => (Array.isArray(v) ? v : [])
+/** Names you gave threads here. Strings only, and never empty — an empty one means "use the harness's title". */
+const asNames = (v) =>
+  Object.fromEntries(
+    Object.entries(asObject(v))
+      .filter(([, name]) => typeof name === 'string' && name.trim())
+      .map(([id, name]) => [id, name.trim().slice(0, 120)]),
+  )
 
 async function readState() {
   try {
@@ -75,6 +84,7 @@ async function readState() {
       seen: asObject(raw.seen),
       hiddenProjects: asArray(raw.hiddenProjects).map(String).filter(Boolean),
       viewedAt: asObject(raw.viewedAt),
+      names: asNames(raw.names),
       settings: raw.settings && typeof raw.settings === 'object' ? raw.settings : null,
       updatedAt: Number(raw.updatedAt) || 0,
     }
@@ -110,6 +120,7 @@ async function writeState(next) {
     seen: asObject(next.seen),
     hiddenProjects: asArray(next.hiddenProjects).map(String).filter(Boolean),
     viewedAt: asObject(next.viewedAt),
+    names: asNames(next.names),
     settings: next.settings && typeof next.settings === 'object' ? next.settings : null,
     updatedAt: Date.now(),
   }

@@ -58,7 +58,7 @@ engine.setPlanetGrade(PLANETS[settings.get('planet')]?.grade)
 const rig = new CameraRig(engine.camera, engine.canvas, settings)
 const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer)
 
-let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {} }
+let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {}, names: {} }
 let threads = []
 /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
 let legendProjects = []
@@ -251,6 +251,31 @@ const actions = {
     queueSave()
     applyThreads(threads)
     hud.toast(`Marked ${thread.title.slice(0, 40)} as viewed`)
+  },
+
+  /** Open the selected thread's title for editing — the card does the typing, `renameThread` the keeping. */
+  startRename: () => {
+    if (selectedId) hud.startRename()
+  },
+
+  /**
+   * Give a thread a name of your own. It lives in the colony file, not the harness: the
+   * session keeps whatever title its own app gave it. An empty name, or the harness's own
+   * title typed back in, drops the override so the thread follows the harness again.
+   */
+  renameThread: (id, name) => {
+    const thread = threads.find((t) => t.id === id)
+    if (!thread) return
+    const original = thread.originalTitle ?? thread.title
+    const clean = String(name ?? '').trim().slice(0, 120)
+    const names = { ...(state.names || {}) }
+    if (!clean || clean === original) delete names[id]
+    else names[id] = clean
+    if ((state.names || {})[id] === names[id]) return
+    state.names = names
+    queueSave()
+    applyThreads(threads)
+    hud.toast(names[id] ? `Renamed to ${clean.slice(0, 40)}` : 'Back to its original name')
   },
 
   hideProject: () => {
@@ -653,6 +678,14 @@ window.addEventListener('keydown', (e) => {
     case 'V':
       if (selectedId) actions.markViewed()
       break
+    case 'r':
+    case 'R':
+      // Held back so the keystroke that opens the field does not also type an "r" into it.
+      if (selectedId) {
+        e.preventDefault()
+        actions.startRename()
+      }
+      break
     case 'c':
     case 'C':
       if (selectedProject) actions.newConversation()
@@ -699,10 +732,21 @@ window.addEventListener('keydown', (e) => {
 function applyThreads(list) {
   // A thread you have said you looked at stops counting as unread until it moves on again.
   // Done here rather than in `statusFor` so the card, the badge and the astronaut all agree.
+  //
+  // Names you gave threads go on here too, for the same reason. `originalTitle` keeps the
+  // harness's own, since this also runs on the already-renamed list after a local change.
   const viewed = state.viewedAt || {}
+  const names = state.names || {}
   threads = list.map((t) => {
     const at = viewed[t.id]
-    return at && t.lastActivityAt <= at ? { ...t, unread: false } : t
+    if (at && t.lastActivityAt <= at) t = { ...t, unread: false }
+    const original = t.originalTitle ?? t.title
+    if (names[t.id]) return { ...t, title: names[t.id], originalTitle: original }
+    if (t.originalTitle !== undefined) {
+      const { originalTitle, ...rest } = t
+      return { ...rest, title: original }
+    }
+    return t
   })
   list = threads
   const archivedSet = new Set(state.archived)
