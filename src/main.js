@@ -70,6 +70,7 @@ let selectedProject = null
 let hoverId = null
 let statusCursor = 0
 let busiestCursor = 0
+let busiestScope = ''
 let pendingSave = 0
 const hoverGround = new THREE.Vector3()
 
@@ -171,11 +172,19 @@ const actions = {
    * "Busiest" is a proxy for now — most recently active thread — until real per-agent spend
    * or call counts exist to rank by instead.
    */
-  focusBusiest: () => {
-    const pool = colony.astronauts.agents
+  focusBusiest: ({ crossProject = false } = {}) => {
+    // Same scoping as focusAgent: the open zone by default, the whole colony with shift.
+    const scoped = !crossProject && selectedProject
+    const pool = colony.astronauts.agents.filter((a) => !scoped || a.thread?.project === selectedProject)
     if (!pool.length) {
-      hud.hint('No crew on the surface')
+      hud.hint(scoped ? `Nobody in ${selectedProject} right now` : 'No crew on the surface')
       return
+    }
+    // A different scope is a different ranking, so start it from the top.
+    const scope = scoped || ''
+    if (scope !== busiestScope) {
+      busiestScope = scope
+      busiestCursor = 0
     }
     const ranked = [...pool].sort((a, b) => (b.thread?.lastActivityAt || 0) - (a.thread?.lastActivityAt || 0))
     const agent = ranked[busiestCursor++ % ranked.length]
@@ -657,7 +666,7 @@ window.addEventListener('keydown', (e) => {
       break
     case 'b':
     case 'B':
-      actions.focusBusiest()
+      actions.focusBusiest({ crossProject: e.shiftKey })
       break
     case 'Tab':
       e.preventDefault()

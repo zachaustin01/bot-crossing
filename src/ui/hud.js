@@ -1203,7 +1203,8 @@ const TEMPLATE = `
         <div class="k"><span>Next crew (zone)</span><kbd>J</kbd></div>
         <div class="k"><span>Next crew (colony)</span><kbd>⇧J</kbd></div>
         <div class="k"><span>Next repo</span><kbd>K</kbd></div>
-        <div class="k"><span>Busiest crew member</span><kbd>B</kbd></div>
+        <div class="k"><span>Busiest crew (zone)</span><kbd>B</kbd></div>
+        <div class="k"><span>Busiest crew (colony)</span><kbd>⇧B</kbd></div>
         <div class="k"><span>Deselect</span><kbd>Esc</kbd></div>
         <div class="k"><span>This sheet</span><kbd>?</kbd></div>
       </div>
