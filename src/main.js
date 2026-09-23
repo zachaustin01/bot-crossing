@@ -186,7 +186,12 @@ const actions = {
       busiestScope = scope
       busiestCursor = 0
     }
-    const ranked = [...pool].sort((a, b) => (b.thread?.lastActivityAt || 0) - (a.thread?.lastActivityAt || 0))
+    // Blocked crew come first, then everyone by most recent activity.
+    const ranked = [...pool].sort(
+      (a, b) =>
+        (b.status === 'blocked') - (a.status === 'blocked') ||
+        (b.thread?.lastActivityAt || 0) - (a.thread?.lastActivityAt || 0)
+    )
     const agent = ranked[busiestCursor++ % ranked.length]
     select(agent.id, { fly: true })
   },
