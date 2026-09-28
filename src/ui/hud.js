@@ -1190,7 +1190,8 @@ const TEMPLATE = `
         <div class="k"><span>Screenshot</span><kbd>P</kbd></div>
       </div>
       <div>
-        <div class="k"><span>Next needing you</span><kbd>N</kbd></div>
+        <div class="k"><span>Next needing you (zone)</span><kbd>N</kbd></div>
+        <div class="k"><span>Next needing you (other zones)</span><kbd>⇧N</kbd></div>
         <div class="k"><span>Open thread</span><kbd>Enter</kbd></div>
         <div class="k"><span>Mark viewed</span><kbd>V</kbd></div>
         <div class="k"><span>Rename</span><kbd>R</kbd></div>
@@ -1201,10 +1202,10 @@ const TEMPLATE = `
         <div class="k"><span>Time of day</span><kbd>L</kbd></div>
         <div class="k"><span>Mute</span><kbd>M</kbd></div>
         <div class="k"><span>Next crew (zone)</span><kbd>J</kbd></div>
-        <div class="k"><span>Next crew (colony)</span><kbd>⇧J</kbd></div>
+        <div class="k"><span>Next crew (next zone)</span><kbd>⇧J</kbd></div>
         <div class="k"><span>Next repo</span><kbd>K</kbd></div>
         <div class="k"><span>Busiest crew (zone)</span><kbd>B</kbd></div>
-        <div class="k"><span>Busiest crew (colony)</span><kbd>⇧B</kbd></div>
+        <div class="k"><span>Busiest crew (other zones)</span><kbd>⇧B</kbd></div>
         <div class="k"><span>Deselect</span><kbd>Esc</kbd></div>
         <div class="k"><span>This sheet</span><kbd>?</kbd></div>
       </div>

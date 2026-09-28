@@ -22,6 +22,7 @@ import {
   revealFolder,
 } from './game/api.js'
 import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-projects.js'
+import { JumpRun, NEEDS_YOU, busiestOrder, crewOrder, inScope, needsYouOrder, nextInRing } from './game/jumps.js'
 
 /**
  * Boot and the outer game loop.
@@ -68,9 +69,8 @@ let selectedId = null
 /** Which zone's sidebar is open. A repo, not a thread — they outlive the threads on them. */
 let selectedProject = null
 let hoverId = null
-let statusCursor = 0
-let busiestCursor = 0
-let busiestScope = ''
+/** The run of B / N / stat-pill presses in progress — see `JumpRun`. */
+const jumpRun = new JumpRun()
 let pendingSave = 0
 const hoverGround = new THREE.Vector3()
 
@@ -123,36 +123,62 @@ const actions = {
     hud.hint(next.label)
   },
 
-  /** Fly to the next astronaut in a given state, cycling through them on repeat presses. */
+  /**
+   * Fly to the next astronaut in a given state — what a HUD stat pill, or the rail's Next
+   * button, jumps to. Always the whole colony: the pills count the whole colony.
+   */
   focusStatus: (status) => {
-    const key = status === 'agents' ? null : status
-    const pool = colony.astronauts.agents.filter((a) => (key ? a.status === key : true))
-    if (!pool.length) {
-      hud.hint(key ? `Nobody is ${(STATUS_LABEL[key] || key).toLowerCase()} right now` : 'No crew on the surface')
+    const keys = status === 'agents' ? null : Array.isArray(status) ? status : [status]
+    const qualifies = (c) => !keys || keys.includes(c.status)
+    const rank = keys ? needsYouOrder : (list) => crewOrder(list, projectOrder())
+    const id = jumpRun.next(
+      `status:${keys || 'all'}`,
+      selectedId,
+      () => rank(jumpCandidates().filter(qualifies)).map((c) => c.id),
+      (id) => isCandidate(id, qualifies)
+    )
+    if (!id) {
+      hud.hint(
+        keys
+          ? keys.length > 1
+            ? 'Nobody needs you right now'
+            : `Nobody is ${(STATUS_LABEL[keys[0]] || keys[0]).toLowerCase()} right now`
+          : 'No crew on the surface'
+      )
       return
     }
-    pool.sort((a, b) => a.id.localeCompare(b.id))
-    const agent = pool[statusCursor++ % pool.length]
-    select(agent.id, { fly: true })
+    select(id, { fly: true })
   },
 
   /**
-   * Cycle to the next crew member. In-project by default when a zone's sidebar is open —
-   * out-of-project (the whole colony) when there is no zone open, or when asked for
-   * explicitly (the shift-modified binding), so the same key can mean either without a
-   * separate pair of bindings to keep in sync.
+   * Next bot waiting on you: errors, then approvals, then replies, longest-waiting first.
+   * The open zone by default; `outside` (shift) is every other zone.
    */
-  focusAgent: ({ crossProject = false } = {}) => {
-    const scoped = !crossProject && selectedProject
-    const pool = colony.astronauts.agents.filter((a) => !scoped || a.thread?.project === selectedProject)
-    if (!pool.length) {
-      hud.hint(scoped ? `Nobody in ${selectedProject} right now` : 'No crew on the surface')
-      return
-    }
-    pool.sort((a, b) => a.id.localeCompare(b.id))
-    const from = pool.findIndex((a) => a.id === selectedId)
-    const agent = pool[(from + 1 + pool.length) % pool.length]
-    select(agent.id, { fly: true })
+  focusNeedsYou: ({ outside = false } = {}) => {
+    const project = selectedProject
+    const qualifies = (c) => NEEDS_YOU.includes(c.status)
+    const id = jumpRun.next(
+      `needs:${outside}`,
+      selectedId,
+      () => needsYouOrder(inScope(jumpCandidates().filter(qualifies), project, { outside })).map((c) => c.id),
+      (id) => isCandidate(id, qualifies)
+    )
+    if (id) select(id, { fly: true })
+    else hud.hint(emptyScopeHint(project, outside, qualifies, 'needs you'))
+  },
+
+  /**
+   * Cycle to the next crew member. Plain stays in the open zone; shift steps out of it, to
+   * the first crew of the next zone along, so repeated shift-presses tour the zones.
+   */
+  focusAgent: ({ outside = false } = {}) => {
+    const project = selectedProject
+    const all = crewOrder(jumpCandidates(), projectOrder())
+    const pool = new Set(inScope(all, project, { outside }).map((c) => c.id))
+    const id = nextInRing(all, (c) => pool.has(c.id) && c.id !== selectedId, selectedId)
+    if (id) select(id, { fly: true })
+    else if (!outside && pool.has(selectedId)) hud.hint(`Nobody else in ${project}`)
+    else hud.hint(emptyScopeHint(project, outside))
   },
 
   /** Step to the next repo, wrapping — the same order the legend lists them in. */
@@ -168,27 +194,19 @@ const actions = {
   },
 
   /**
-   * Jump to whoever has been busiest lately, cycling through the ranking on repeat presses.
-   * "Busiest" is a proxy for now — most recently active thread — until real per-agent spend
-   * or call counts exist to rank by instead.
+   * Jump to whoever has been busiest lately, walking down the ranking on repeat presses.
+   * Plain ranks the open zone; shift ranks everything outside it.
    */
-  focusBusiest: ({ crossProject = false } = {}) => {
-    // Same scoping as focusAgent: the open zone by default, the whole colony with shift.
-    const scoped = !crossProject && selectedProject
-    const pool = colony.astronauts.agents.filter((a) => !scoped || a.thread?.project === selectedProject)
-    if (!pool.length) {
-      hud.hint(scoped ? `Nobody in ${selectedProject} right now` : 'No crew on the surface')
-      return
-    }
-    // A different scope is a different ranking, so start it from the top.
-    const scope = scoped || ''
-    if (scope !== busiestScope) {
-      busiestScope = scope
-      busiestCursor = 0
-    }
-    const ranked = [...pool].sort((a, b) => (b.thread?.lastActivityAt || 0) - (a.thread?.lastActivityAt || 0))
-    const agent = ranked[busiestCursor++ % ranked.length]
-    select(agent.id, { fly: true })
+  focusBusiest: ({ outside = false } = {}) => {
+    const project = selectedProject
+    const id = jumpRun.next(
+      `busiest:${outside}`,
+      selectedId,
+      () => busiestOrder(inScope(jumpCandidates(), project, { outside })).map((c) => c.id),
+      (id) => isCandidate(id)
+    )
+    if (id) select(id, { fly: true })
+    else hud.hint(emptyScopeHint(project, outside))
   },
 
   focusProject: (name) => {
@@ -388,6 +406,37 @@ const hud = new Hud(app, settings, actions)
 
 let lastVoiced = null
 let lastPhrase = 0
+
+/** The crew as the jump keys see them — see game/jumps.js. */
+function jumpCandidates() {
+  return colony.astronauts.agents.map((a) => ({
+    id: a.id,
+    status: a.status,
+    project: a.thread?.project,
+    lastActivityAt: a.thread?.lastActivityAt || 0,
+  }))
+}
+
+function projectOrder() {
+  return colony.plotOrder.map((p) => p.id)
+}
+
+/** Still on the surface, and (if asked) still in the state the jump was looking for. */
+function isCandidate(id, qualifies) {
+  const agent = colony.agentFor(id)
+  if (!agent) return false
+  return !qualifies || qualifies({ id, status: agent.status, project: agent.thread?.project })
+}
+
+/** Why a scoped jump found nobody — and, when the other side has someone, which key reaches them. */
+function emptyScopeHint(project, outside, qualifies = () => true, what = 'crew') {
+  const nobody = what === 'crew' ? 'No crew' : 'Nobody'
+  const tail = what === 'crew' ? '' : ` ${what}`
+  if (!project) return `${nobody}${tail} anywhere right now`
+  const others = inScope(jumpCandidates().filter(qualifies), project, { outside: !outside }).length
+  const tip = others ? ` — ${others} ${outside ? 'in it, drop' : 'elsewhere, hold'} shift` : ''
+  return `${nobody} ${outside ? 'outside' : 'in'} ${project}${tail}${tip}`
+}
 
 function select(id, { fly = false } = {}) {
   selectedId = id
@@ -635,7 +684,7 @@ window.addEventListener('keydown', (e) => {
       break
     case 'n':
     case 'N':
-      actions.focusStatus('waiting')
+      actions.focusNeedsYou({ outside: e.shiftKey })
       break
     case 'p':
     case 'P':
@@ -654,11 +703,10 @@ window.addEventListener('keydown', (e) => {
       settings.set('sound', !settings.get('sound'))
       hud.hint(settings.get('sound') ? 'Sound on' : 'Muted')
       break
-    // Plain jumps within the open zone; shift jumps the whole colony — one binding, the
-    // modifier is what decides scope, so there is nothing else to keep in sync.
+    // N, J and B share one rule: plain stays inside the open zone, shift goes outside it.
     case 'j':
     case 'J':
-      actions.focusAgent({ crossProject: e.shiftKey })
+      actions.focusAgent({ outside: e.shiftKey })
       break
     case 'k':
     case 'K':
@@ -666,7 +714,7 @@ window.addEventListener('keydown', (e) => {
       break
     case 'b':
     case 'B':
-      actions.focusBusiest({ crossProject: e.shiftKey })
+      actions.focusBusiest({ outside: e.shiftKey })
       break
     case 'Tab':
       e.preventDefault()
