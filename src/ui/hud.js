@@ -1201,31 +1201,29 @@ const TEMPLATE = `
         <div class="k"><span>Zoom to cursor</span><kbd>scroll</kbd></div>
         <div class="k"><span>Move / zoom</span><kbd>arrows</kbd> <kbd>+ −</kbd></div>
         <div class="k"><span>Reset view</span><kbd>0</kbd></div>
+        <div class="k"><span>Orbit mode</span><kbd>O</kbd></div>
+        <div class="k"><span>Next / previous planet</span><kbd>Tab</kbd> <kbd>⇧Tab</kbd></div>
+        <div class="k"><span>Time of day</span><kbd>L</kbd></div>
         <div class="k"><span>Hide all UI</span><kbd>H</kbd> <kbd>${IS_MAC ? '⌘' : 'Ctrl'}\\</kbd></div>
         <div class="k"><span>Settings</span><kbd>S</kbd></div>
         <div class="k"><span>Screenshot</span><kbd>P</kbd></div>
+        <div class="k"><span>Mute</span><kbd>M</kbd></div>
       </div>
       <div>
-        <div class="k"><span>Next needing you (zone)</span><kbd>N</kbd></div>
-        <div class="k"><span>Next needing you (other zones)</span><kbd>⇧N</kbd></div>
+        <div class="k"><span>Next needing you</span><kbd>N</kbd> <kbd>⇧N</kbd></div>
+        <div class="k"><span>Next crew</span><kbd>J</kbd> <kbd>⇧J</kbd></div>
+        <div class="k"><span>Busiest crew</span><kbd>B</kbd> <kbd>⇧B</kbd></div>
+        <div class="k"><span>Next repo</span><kbd>K</kbd></div>
         <div class="k"><span>Open thread</span><kbd>Enter</kbd></div>
         <div class="k"><span>Mark viewed</span><kbd>V</kbd></div>
         <div class="k"><span>Rename</span><kbd>R</kbd></div>
         <div class="k"><span>Archive</span><kbd>A</kbd></div>
         <div class="k"><span>New conversation</span><kbd>C</kbd></div>
-        <div class="k"><span>Orbit mode</span><kbd>O</kbd></div>
-        <div class="k"><span>Change planet</span><kbd>Tab</kbd></div>
-        <div class="k"><span>Time of day</span><kbd>L</kbd></div>
-        <div class="k"><span>Mute</span><kbd>M</kbd></div>
-        <div class="k"><span>Next crew (zone)</span><kbd>J</kbd></div>
-        <div class="k"><span>Next crew (next zone)</span><kbd>⇧J</kbd></div>
-        <div class="k"><span>Next repo</span><kbd>K</kbd></div>
-        <div class="k"><span>Busiest crew (zone)</span><kbd>B</kbd></div>
-        <div class="k"><span>Busiest crew (other zones)</span><kbd>⇧B</kbd></div>
         <div class="k"><span>Deselect</span><kbd>Esc</kbd></div>
         <div class="k"><span>This sheet</span><kbd>?</kbd></div>
       </div>
     </div>
+    <p class="sub" style="margin-top:10px">N, J and B stay in the open zone; add ⇧ to jump to the other zones instead.</p>
     <div style="margin-top:16px">
       <div class="legend-row"><i class="badge" style="background:#1a2b46;color:#8fb4ee">?</i> waiting on your reply — click to open the thread</div>
       <div class="legend-row"><i class="badge" style="background:#3d1c1c;color:#e88b8b">!</i> the session hit an error</div>

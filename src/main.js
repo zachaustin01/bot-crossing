@@ -109,9 +109,11 @@ const actions = {
     return on
   },
 
-  cyclePlanet: () => {
+  /** Next planet, or the previous one with `back` (shift+Tab), wrapping either way. */
+  cyclePlanet: ({ back = false } = {}) => {
     const ids = Object.keys(PLANETS)
-    const next = ids[(ids.indexOf(settings.get('planet')) + 1) % ids.length]
+    const step = back ? -1 : 1
+    const next = ids[(ids.indexOf(settings.get('planet')) + step + ids.length) % ids.length]
     settings.set('planet', next)
     hud.hint(`${PLANETS[next].name} — ${PLANETS[next].blurb}`)
   },
@@ -977,7 +979,7 @@ window.addEventListener('keydown', (e) => {
       break
     case 'Tab':
       e.preventDefault()
-      actions.cyclePlanet()
+      actions.cyclePlanet({ back: e.shiftKey })
       break
     case '0':
       actions.resetView()
