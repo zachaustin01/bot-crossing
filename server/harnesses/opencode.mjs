@@ -12,6 +12,14 @@
  * the app that wrote it. There is nothing to address a single build with —
  * the scheme is shared.
  *
+ * OpenCode v2 moved its sessions into a `session_v2` table and inline their
+ * messages into `session_message` (`type` column, content embedded in the row's
+ * `data`). An upgraded database keeps the legacy `session` table around, but
+ * only as whatever it held before the upgrade — so when `session_v2` exists it
+ * is read and the legacy table is left alone. A build that never migrated has
+ * no `session_v2` and takes the legacy path, both shapes side by side because
+ * stable and dev databases are written by different OpenCode versions.
+ *
  * Only top-level sessions count as threads — child rows with `parent_id` set
  * are the task tool's subagents, and OpenCode's own session list filters them
  * the same way. Including them would stand hundreds of astronauts on the map
@@ -107,8 +115,8 @@ function projectOf(directory) {
 /** First user text per session never changes, so it is kept forever. */
 const previewCache = new Map()
 
-async function firstUserText(db, sessionId) {
-  if (previewCache.has(sessionId)) return previewCache.get(sessionId)
+/** Legacy rows: text arrives through the parts of a message. */
+function firstUserTextLegacy(db, sessionId) {
   let out = ''
   try {
     const msgs = db
@@ -141,6 +149,36 @@ async function firstUserText(db, sessionId) {
   } catch {
     out = ''
   }
+  return out
+}
+
+/** v2 rows: the user's text sits inline on the `session_message` row. */
+function firstUserTextV2(db, sessionId) {
+  let out = ''
+  try {
+    const msgs = db
+      .prepare(`SELECT data FROM session_message WHERE session_id = ? AND type = 'user' ORDER BY seq ASC LIMIT 8`)
+      .all(sessionId)
+    for (const m of msgs) {
+      try {
+        const d = JSON.parse(m.data)
+        if (typeof d?.text === 'string' && clean(d.text)) {
+          out = clean(d.text)
+          break
+        }
+      } catch {
+        /* a row mid-write — skip it */
+      }
+    }
+  } catch {
+    out = ''
+  }
+  return out
+}
+
+async function firstUserText(db, sessionId, v2) {
+  if (previewCache.has(sessionId)) return previewCache.get(sessionId)
+  const out = (v2 ? firstUserTextV2 : firstUserTextLegacy)(db, sessionId)
   previewCache.set(sessionId, out)
   return out
 }
@@ -149,12 +187,15 @@ async function firstUserText(db, sessionId) {
 const factsCache = new Map()
 
 /**
- * Whether an error-status tool part means the run failed.
+ * Error text that means the user stopped the turn, not that it failed.
  *
  * Seen in the wild: `The user rejected permission to use this specific tool
- * call.` and `Tool execution aborted` — both are the user stopping the turn,
- * not the turn failing. Only a genuine failure reddens an astronaut.
+ * call.` and `Tool execution aborted`. Only a genuine failure reddens an
+ * astronaut.
  */
+const USER_STOPPED = /user rejected permission|permission.{0,20}denied|denied.{0,20}permission|execution aborted|aborted|cancelled/i
+
+/** Whether a legacy error-status tool part means the run failed. */
 function isRealError(raw) {
   let text = ''
   try {
@@ -164,13 +205,33 @@ function isRealError(raw) {
   } catch {
     return true
   }
-  return !/user rejected permission|permission.{0,20}denied|denied.{0,20}permission|execution aborted|aborted|cancelled/i.test(text)
+  return !USER_STOPPED.test(text)
 }
 
-async function sessionFacts(db, sessionId, timeUpdated) {
+/**
+ * The same verdict for a v2 tool part, embedded in its message's `content` —
+ * its output may be a string or a list of content blocks.
+ */
+function isRealErrorV2(part) {
+  const state = part?.state || {}
+  const output = typeof state.output === 'string'
+    ? state.output
+    : Array.isArray(state.content)
+      ? state.content.filter((c) => c?.type === 'text').map((c) => c.text).join('\n')
+      : ''
+  return !USER_STOPPED.test(`${state.error || ''}\n${output}`)
+}
+
+async function sessionFacts(db, sessionId, timeUpdated, v2) {
   const hit = factsCache.get(sessionId)
   if (hit && hit.timeUpdated === timeUpdated) return hit.facts
   const facts = { running: false, hasError: false, sizeBytes: 0 }
+  if (v2) return await v2Facts(db, sessionId, timeUpdated, facts)
+  return await legacyFacts(db, sessionId, timeUpdated, facts)
+}
+
+/** Legacy schema: one row per message in `message`, parts in `part`. */
+async function legacyFacts(db, sessionId, timeUpdated, facts) {
   // Counted separately: a store with only one of the two tables still sizes
   // from the half it has, rather than zeroing both on one throw.
   try {
@@ -230,6 +291,76 @@ async function sessionFacts(db, sessionId, timeUpdated) {
   return facts
 }
 
+/**
+ * v2 schema: every message — its text and its tool calls together — is one
+ * `session_message` row with the content embedded in `data`, and the trailing
+ * `idle` handshake rows are not messages at all. Same verdicts as the legacy
+ * path: failed means failed, stopped means stopped.
+ */
+async function v2Facts(db, sessionId, timeUpdated, facts) {
+  try {
+    const bytes = db
+      .prepare(`SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM session_message WHERE session_id = ?`)
+      .get(sessionId)
+    facts.sizeBytes = num(bytes?.n)
+  } catch {
+    /* no session_message yet — the thread still lists */
+  }
+  try {
+    const rows = db
+      .prepare(
+        `SELECT type, data FROM session_message WHERE session_id = ? AND type IN ('user','assistant') ORDER BY seq DESC LIMIT 3`
+      )
+      .all(sessionId)
+    if (rows.length) {
+      const parse = (r) => {
+        try {
+          return JSON.parse(r.data) || {}
+        } catch {
+          return {}
+        }
+      }
+      // The newest row outside the idle handshakes decides the shape of the
+      // turn: a trailing user message means the model speaks next — whatever
+      // the process is doing, it is not waiting on anyone. A turn that ended
+      // in error or abort is over too, even when it carries no finish stamp.
+      const lastAssistant = rows.find((r) => r.type === 'assistant')
+      const a = lastAssistant ? parse(lastAssistant) : null
+      const completed = typeof a?.time?.completed === 'number'
+      const finished = typeof a?.finish === 'string' && a.finish
+      const msgError = typeof a?.error?.name === 'string' ? a.error.name : ''
+      const aborted = /abort/i.test(msgError)
+      const open = rows[0].type === 'user' || (lastAssistant && rows[0].type === 'assistant' && !completed && !finished && !msgError)
+      facts.running = open && Date.now() - num(timeUpdated) < ACTIVE_WINDOW_MS
+      if (lastAssistant && (completed || finished || msgError)) {
+        if (aborted) {
+          // The user stopped the turn. Same as pressing escape elsewhere:
+          // an abandoned turn is not a failed one.
+          facts.hasError = false
+        } else if (msgError) {
+          // The turn itself failed (provider/auth error) — that is what the
+          // red eyes are for, even when no single tool part takes the blame.
+          facts.hasError = true
+        } else {
+          // Only the last turn counts: a historic tool error must not redden
+          // an astronaut forever. The tool calls ride inside the assistant
+          // row's own `content`, so the recent rows are searched here rather
+          // than in a parts table. At most three rows, so each is parsed
+          // outright rather than pre-filtered on its JSON spelling.
+          facts.hasError = rows
+            .map((r) => parse(r))
+            .flatMap((d) => (Array.isArray(d.content) ? d.content : []))
+            .some((part) => part?.type === 'tool' && part?.state?.status === 'error' && isRealErrorV2(part))
+        }
+      }
+    }
+  } catch {
+    /* mid-write, or gone */
+  }
+  factsCache.set(sessionId, { timeUpdated, facts })
+  return facts
+}
+
 async function readDbFile(dbFile) {
   const sqlite = await sqliteApi()
   if (!sqlite?.DatabaseSync) return []
@@ -245,37 +376,82 @@ async function readDbFile(dbFile) {
     const tables = new Set(
       db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all().map((r) => r.name)
     )
-    // Only `session` is load-bearing: the message/part reads below degrade to
-    // empty facts when their tables are absent, rather than costing the pass.
-    if (!tables.has('session')) return []
+    // When the v2 tables exist they are the live ones — the legacy `session`
+    // table in a migrated database only holds whatever it held before the
+    // upgrade. A build that never migrated takes the legacy path instead.
+    const v2 = tables.has('session_v2')
+    // Only the chosen thread table is load-bearing: the message reads below
+    // degrade to empty facts when their table is absent, rather than costing
+    // the pass.
+    if (!v2 && !tables.has('session')) return []
     // Undocumented private state that drifts between versions — probe every
     // column before naming it, or one renamed column costs the whole harness.
-    const cols = new Set(db.prepare(`PRAGMA table_info(session)`).all().map((r) => r.name))
+    const threadTable = v2 ? 'session_v2' : 'session'
+    const cols = new Set(db.prepare(`PRAGMA table_info(${threadTable})`).all().map((r) => r.name))
     for (const need of ['id', 'directory', 'title', 'time_created', 'time_updated']) {
       if (!cols.has(need)) return []
     }
+    // v2 sleeves every session under a project row whose `worktree` is the
+    // base checkout — an OpenCode-managed git worktree (which lives outside
+    // the repo, in the data dir) is still that repo's thread, so the join is
+    // what keeps such a worktree from reading like its own project. Probed
+    // like every other undocumented shape: a `project` table without the
+    // expected column, or a legacy database with none at all, simply loses
+    // the join.
+    let projectRoots = null
+    if (v2 && tables.has('project')) {
+      const pcols = new Set(db.prepare(`PRAGMA table_info(project)`).all().map((c) => c.name))
+      if (pcols.has('id') && pcols.has('worktree')) {
+        projectRoots = new Map(
+          db.prepare(`SELECT id, worktree FROM project WHERE worktree IS NOT NULL`).all().map((p) => [p.id, p.worktree])
+        )
+      }
+    }
     const rows = db
       .prepare(
-        `SELECT id, directory, title, agent, model, time_created, time_updated, time_archived FROM session ${cols.has('parent_id') ? 'WHERE parent_id IS NULL' : ''} ORDER BY time_updated DESC`
+        `SELECT id${
+          v2 ? ', project_id' : ''
+        }, directory, title, agent, model, time_created, time_updated, time_archived FROM ${threadTable} ${cols.has('parent_id') ? 'WHERE parent_id IS NULL' : ''} ORDER BY time_updated DESC`
       )
       .all()
     const out = []
+    const joinName = (p) => {
+      if (typeof p !== 'string' || !p || p === '/' || p === '\\') return null
+      return path.basename(p.replace(/[\\/]+$/, '')) || null
+    }
     for (const r of rows) {
       if (typeof r.id !== 'string' || !r.id) continue
-      const { projectPath, project, cwd } = projectOf(r.directory)
+      const dir = typeof r.directory === 'string' ? r.directory : ''
+      // The project the thread belongs to: an explicit project row wins when
+      // the session's directory is inside the base checkout — or when it is
+      // one of OpenCode's own managed worktrees, which live in the data dir
+      // (`worktree/<project-id-prefix>/<name>`) rather than under the repo, so
+      // a path test would strand them. Anything else keeps the honest
+      // directory basename it always had.
+      const root = projectRoots?.get(r.project_id) || null
+      // Trailing separators trimmed on both sides, so `/repo/` and `/repo`
+      // are the same checkout whichever of them OpenCode stored.
+      const base = typeof root === 'string' ? root.replace(/[\\/]+$/, '') : ''
+      const trimmed = dir.replace(/[\\/]+$/, '')
+      const under = (parent) => trimmed.startsWith(parent + '/') || trimmed.startsWith(parent + path.sep)
+      const managed = Boolean(base) && under(path.join(dataDir(), 'worktree'))
+      const inRoot = Boolean(base && trimmed && (trimmed === base || under(base))) || managed
+      const name = inRoot ? joinName(root) : null
+      const { projectPath, project, cwd } = name
+        ? { projectPath: base, project: name, cwd: dir }
+        : projectOf(dir)
+      const worktree = name && trimmed !== base ? path.basename(trimmed.replace(/\\/g, '/')) : ''
       const { model, effort } = parseModel(r.model)
-      const prompt = await firstUserText(db, r.id)
+      const prompt = await firstUserText(db, r.id, v2)
       const title = clean(r.title) || prompt || 'Untitled thread'
-      const facts = await sessionFacts(db, r.id, num(r.time_updated))
+      const facts = await sessionFacts(db, r.id, num(r.time_updated), v2)
       out.push({
         id: ID(r.id),
         title: title.slice(0, 120),
         preview: prompt.slice(0, 240),
         project,
         projectPath,
-        // OpenCode has no worktree concept of its own, and guessing one from
-        // the path would put a branch name on a thread that never had one.
-        worktree: '',
+        worktree,
         cwd,
         gitBranch: '',
         model,

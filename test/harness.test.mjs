@@ -663,6 +663,182 @@ test('opencode scans with only a session table rather than losing every thread',
   }
 })
 
+// ── OpenCode v2 schema (session_v2 + session_message) ────────────────────────
+
+/**
+ * A cookie for the migrated stable database: OpenCode v2 keeps its sessions in
+ * `session_v2` and their messages inline in `session_message`, while the old
+ * `session`/`message`/`part` tables keep whatever they had before the upgrade.
+ * The scan must prefer the v2 tables whenever they exist — reading the legacy
+ * `session` table in a migrated database shows weeks-old ghosts and none of
+ * the live threads.
+ */
+const V2_SESSION_DONE = 'ses_v2done0000000000000000001a'
+const V2_SESSION_RUNNING = 'ses_v2running0000000000000001b'
+const V2_SESSION_CHILD = 'ses_v2child00000000000000001c'
+const V2_SESSION_ARCHIVED = 'ses_v2archived00000000000001d'
+
+async function fakeOpencodeV2() {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'opencode-v2-'))
+  const file = path.join(dir, 'opencode.db')
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(file)
+  db.exec(
+    `CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+      directory TEXT NOT NULL, title TEXT NOT NULL, agent TEXT, model TEXT,
+      time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER)`
+  )
+  db.exec(
+    `CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, workspace_id TEXT, parent_id TEXT,
+      directory TEXT, title TEXT, version TEXT, agent TEXT, model TEXT,
+      time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER)`
+  )
+  db.exec(
+    `CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT,
+      seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+      data TEXT NOT NULL)`
+  )
+  const now = Date.now()
+  const stale = db.prepare(
+    `INSERT INTO session (id, project_id, parent_id, directory, title, agent, model,
+      time_created, time_updated, time_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+  // Only in the legacy table, like a thread deleted after the upgrade — it
+  // must not surface while session_v2 exists.
+  stale.run('ses_staleghost00000000000000001', 'global', null, '/tmp/old', 'Pre-upgrade ghost', 'build', '', now - 99999999, now - 99999999, null)
+  const ins = db.prepare(
+    `INSERT INTO session_v2 (id, project_id, workspace_id, parent_id, directory, title, agent, model,
+      time_created, time_updated, time_archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+  const live = db.prepare(
+    `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+  const doneJson = JSON.stringify({
+    time: { created: now - 60000, completed: now - 30000 },
+    finish: 'stop',
+    content: [
+      { type: 'text', text: 'all done' },
+      { type: 'tool', state: { status: 'error', error: 'File not found: nope.txt' } },
+    ],
+  })
+  const runningJson = JSON.stringify({
+    time: { created: now - 15000, streamed: now - 5000 },
+    finish: null,
+    content: [{ type: 'text', text: 'still working' }],
+  })
+  const userSk = now - 60000
+  ins.run(V2_SESSION_DONE, 'global', null, null, '/tmp/demo', 'Wave one', 'build',
+    '{"id":"muse-spark","providerID":"opencode","variant":"default"}', now - 70000, now - 30000, null)
+  ins.run(V2_SESSION_RUNNING, 'global', null, null, '/tmp/demo', 'Wave two', 'build', null, now - 20000, now, null)
+  ins.run(V2_SESSION_CHILD, 'global', null, V2_SESSION_RUNNING, '/tmp/demo', 'Subtask', 'general', null, now - 10000, now, null)
+  ins.run(V2_SESSION_ARCHIVED, 'global', null, null, '/tmp/demo', 'Old wave', 'build', null, now - 80000, now - 75000, now - 74000)
+  live.run('sm_u1', V2_SESSION_DONE, 'user', 1, now - 60000, now - 60000, JSON.stringify({ time: { created: now - 60000 }, text: '  wave   one please  ' }))
+  live.run('sm_a1', V2_SESSION_DONE, 'assistant', 2, now - 50000, now - 30000, doneJson)
+  live.run('sm_u2', V2_SESSION_RUNNING, 'user', 1, now - 20000, now - 20000, JSON.stringify({ time: { created: now - 20000 }, text: 'wave two' }))
+  live.run('sm_a2', V2_SESSION_RUNNING, 'assistant', 2, now - 15000, now - 5000, runningJson)
+  db.close()
+  process.env.OPENCODE_DB = file
+  return { dir, h: opencode }
+}
+
+test('a migrated opencode v2 database is read whole: v2 wins over the stale legacy table', async () => {
+  const { dir, h } = await fakeOpencodeV2()
+  try {
+    assert.equal(await h.detect(), true)
+    const threads = await h.scanThreads()
+    const ids = threads.map((t) => t.id)
+    assert.ok(!ids.some((id) => id.includes('staleghost')), 'a row only the legacy table has must not appear while v2 exists')
+    assert.ok(!ids.some((id) => id.includes('v2child')), 'a v2 task child is not its own astronaut')
+    const done = threads.find((t) => t.id === `opencode:${V2_SESSION_DONE}`)
+    const running = threads.find((t) => t.id === `opencode:${V2_SESSION_RUNNING}`)
+    const archived = threads.find((t) => t.id === `opencode:${V2_SESSION_ARCHIVED}`)
+    assert.ok(done && running && archived, 'every top-level v2 session is scanned')
+    assert.equal(done.title, 'Wave one')
+    assert.equal(done.preview, 'wave one please', 'the first user message text is trimmed but not mangled')
+    assert.equal(done.model, 'muse-spark')
+    assert.equal(done.project, 'demo')
+    assert.equal(done.cwd, '/tmp/demo')
+    assert.equal(done.running, false, 'a completed turn is not running')
+    assert.equal(done.hasError, true, 'a tool error in the last turn reddens the astronaut')
+    assert.ok(done.sizeBytes > 0, 'v2 message data sizes the building')
+    assert.equal(running.running, true, 'an open v2 turn inside the window is running')
+    assert.equal(running.hasError, false)
+    assert.equal(archived.archived, true, 'time_archived still marks archived threads')
+  } finally {
+    delete process.env.OPENCODE_DB
+    await fsp.rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a v2 session in an OpenCode-managed worktree reports its base repo as the project', async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'opencode-v2-wt-'))
+  const file = path.join(dir, 'opencode.db')
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(file)
+  const now = Date.now()
+  db.exec(
+    `CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, workspace_id TEXT, parent_id TEXT,
+      directory TEXT, title TEXT, agent TEXT, model TEXT, time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL, time_archived INTEGER)`
+  )
+  db.exec(`CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT)`)
+  const base = '/tmp/the-repo'
+  db.prepare(`INSERT INTO project (id, worktree) VALUES (?, ?)`).run('proj0000000000000000000001aa', base)
+  // OpenCode's own worktrees live in its data dir, not under the repo.
+  const xdg = path.join(dir, 'share')
+  process.env.XDG_DATA_HOME = xdg
+  const managed = path.join(xdg, 'opencode', 'worktree', 'proj0000', 'leafy-branch')
+  await fsp.mkdir(managed, { recursive: true })
+  const ins = db.prepare(
+    `INSERT INTO session_v2 (id, project_id, parent_id, directory, title, agent, model, time_created, time_updated, time_archived)
+      VALUES ( ?, ?, NULL, ?, ?, 'build', NULL, ?, ?, NULL)`
+  )
+  ins.run('ses_wtroot00000000000000000001', 'proj0000000000000000000001aa', base, 'At the root', now - 5000, now)
+  ins.run('ses_wtleaf00000000000000000002', 'proj0000000000000000000001aa', `${base}/.worktrees/leafy-branch`, 'In a worktree', now - 4000, now)
+  // A session whose project_id points nowhere: grouping falls back to the directory.
+  db.prepare(
+    `INSERT INTO session_v2 (id, project_id, parent_id, directory, title, agent, model, time_created, time_updated, time_archived)
+      VALUES ( ?, 'gone0000000000000000000000000b', NULL, ?, ?, 'build', NULL, ?, ?, NULL)`
+  ).run('ses_wtlost00000000000000000003', '/tmp/orphan-dir', 'Orphaned', now - 3000, now)
+  db.prepare(
+    `INSERT INTO session_v2 (id, project_id, parent_id, directory, title, agent, model, time_created, time_updated, time_archived)
+      VALUES ( ?, 'proj0000000000000000000001aa', NULL, ?, ?, 'build', NULL, ?, ?, NULL)`
+  ).run('ses_wtop000000000000000000004', managed, 'OpenCode-managed', now - 2000, now)
+  // The base checkout spelled with a trailing slash is still the base checkout.
+  db.prepare(
+    `INSERT INTO session_v2 (id, project_id, parent_id, directory, title, agent, model, time_created, time_updated, time_archived)
+      VALUES ( ?, 'proj0000000000000000000001aa', NULL, ?, ?, 'build', NULL, ?, ?, NULL)`
+  ).run('ses_wtslash0000000000000000005', `${base}/`, 'Trailing slash', now - 1000, now)
+  db.close()
+  process.env.OPENCODE_DB = file
+  try {
+    const threads = new Map((await opencode.scanThreads()).map((t) => [t.id, t]))
+    const root = threads.get('opencode:ses_wtroot00000000000000000001')
+    assert.equal(root.project, 'the-repo')
+    assert.equal(root.projectPath, base)
+    assert.equal(root.worktree, '', 'the sessions right in the base checkout carry no worktree name')
+    const leaf = threads.get('opencode:ses_wtleaf00000000000000000002')
+    assert.equal(leaf.project, 'the-repo', 'a worktree session groups under its base repo, not the worktree dir name')
+    assert.equal(leaf.projectPath, base)
+    assert.equal(leaf.cwd, `${base}/.worktrees/leafy-branch`, 'cwd stays where the files actually are')
+    assert.equal(leaf.worktree, 'leafy-branch')
+    const lost = threads.get('opencode:ses_wtlost00000000000000000003')
+    assert.equal(lost.project, 'orphan-dir', 'an unmappable session keeps the old directory-basename grouping')
+    const op = threads.get('opencode:ses_wtop000000000000000000004')
+    assert.equal(op.project, 'the-repo', 'an OpenCode-run worktree outside the repo still groups under the base repo')
+    assert.equal(op.worktree, 'leafy-branch')
+    assert.equal(op.cwd, managed)
+    const slash = threads.get('opencode:ses_wtslash0000000000000000005')
+    assert.equal(slash.project, 'the-repo')
+    assert.equal(slash.worktree, '', 'a trailing slash does not turn the base checkout into a worktree')
+  } finally {
+    delete process.env.OPENCODE_DB
+    delete process.env.XDG_DATA_HOME
+    await fsp.rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('opencode reads the stable database before the dev one', () => {
   const basenames = defaultDbFiles().slice(0, 2).map((f) => path.basename(f))
   assert.deepEqual(basenames, ['opencode.db', 'opencode-dev.db'])
