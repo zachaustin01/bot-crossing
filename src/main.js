@@ -197,6 +197,23 @@ const actions = {
     else hud.hint(emptyScopeHint(project, outside))
   },
 
+  /** Type-to-find over the open repo's threads that are on the map; Enter flies to the pick. */
+  openSearch: () => {
+    if (!selectedProject) {
+      hud.hint('Open a repo first, then press / to find a thread in it')
+      return
+    }
+    const list = [...colony.threads.values()]
+      .filter((t) => t.project === selectedProject && isCandidate(t.id))
+      .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))
+      .map((t) => ({ id: t.id, title: t.title, worktree: t.worktree, status: statusFor(t, Date.now()) }))
+    if (!list.length) {
+      hud.hint(`No threads on the map in ${selectedProject}`)
+      return
+    }
+    hud.openSearch(list, (id) => select(id, { fly: true }))
+  },
+
   /** Step to the next repo, wrapping — the same order the legend lists them in. */
   cycleProject: () => {
     const order = colony.plotOrder
@@ -1055,6 +1072,12 @@ window.addEventListener('keydown', (e) => {
     case 'J':
       actions.focusAgent({ outside: e.shiftKey })
       break
+    case '/':
+    case 'f':
+    case 'F':
+      e.preventDefault()
+      actions.openSearch()
+      break
     case 'k':
     case 'K':
       actions.cycleProject()
@@ -1125,6 +1148,7 @@ window.addEventListener('keydown', (e) => {
     // One step at a time, outward: the drag in hand, the thread, then the zone.
     case 'Escape':
       if (hud.closeHarnessMenu?.()) break
+      if (hud.closeSearch()) break
       if (drag.lifted || drag.timer) {
         cancelHold()
         if (drag.lifted) {
