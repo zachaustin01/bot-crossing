@@ -1,0 +1,4 @@
+# Copy to .envrc and allow it (`direnv allow`) for per-machine colony state.
+# Each host then keeps its own state file — useful when the checkout lives in
+# a synced folder (Dropbox) shared by several machines.
+export BOT_CROSSING_STATE="data/$(hostname -s)-colony.json"

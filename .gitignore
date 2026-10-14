@@ -9,6 +9,10 @@ data/*.tmp
 # Per-machine Claude Code permissions — personal paths live in here.
 .claude/settings.local.json
 
+# Local env overrides (direnv, dotenv) — per-machine, never checked in.
+.env*
+!.envrc.sample
+
 # Raw asset packs. The built glbs in public/assets are checked in instead — see the README
 # under "Where the art comes from" for how to re-fetch these if you need to rebuild.
 assets-src
