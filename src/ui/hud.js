@@ -1580,6 +1580,7 @@ const TEMPLATE = `
         <div class="k"><span>Next repo</span><kbd>K</kbd></div>
         <div class="k"><span>Walk this bot's family</span><kbd>G</kbd></div>
         <div class="k"><span>Its family's manager</span><kbd>⇧G</kbd></div>
+        <div class="k"><span>Next team in this repo</span><kbd>T</kbd> <kbd>⇧T</kbd></div>
         <div class="k"><span>Find a thread in this repo</span><kbd>/</kbd> <kbd>F</kbd></div>
         <div class="k"><span>Open thread</span><kbd>Enter</kbd></div>
         <div class="k"><span>Mark viewed</span><kbd>V</kbd></div>
