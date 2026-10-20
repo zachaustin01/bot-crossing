@@ -1385,7 +1385,6 @@ export class Colony {
     }
   }
 
-  /** Which buildings have scaffolding up right now, and where its poles stand. */
   /**
    * Every crew building's flag, placed fresh each frame from the building it stands by: the
    * pole is at the building's edge, turned with it, and rides its rise and its sink — a flag
@@ -1418,6 +1417,7 @@ export class Colony {
     this.squadFlags.end()
   }
 
+  /** Which buildings have scaffolding up right now, and where its poles stand. */
   _scaffoldSites(includePlanned = false) {
     const sites = []
     for (const [id, entry] of this.buildings) {
