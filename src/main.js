@@ -28,6 +28,7 @@ import {
 import { sortHarnessChoices, harnessReason } from './game/harnesses.js'
 import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-projects.js'
 import { withErrands } from './game/errands.js'
+import { buildFamilies, crewSummary, familyRing } from './game/families.js'
 import { archivedInProject, restorableArchives, unarchive, withLocalArchive } from './game/archive.js'
 import { ACTIVE, JumpRun, NEEDS_YOU, busiestOrder, crewOrder, inScope, needsYouOrder, nextInRing } from './game/jumps.js'
 
@@ -68,6 +69,8 @@ const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer
 
 let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {}, names: {} }
 let threads = []
+/** Who started whom, among the threads on the map — rebuilt every poll. See game/families.js. */
+let families = buildFamilies([])
 /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
 let legendProjects = []
 /** The zone layout as last written to the colony file, so an unchanged map is not re-saved. */
@@ -264,6 +267,41 @@ const actions = {
   select: (id) => select(id, {}),
 
   focusThread: (id) => select(id, { fly: true }),
+
+  /**
+   * Walk the selected thread's family: its manager, then the crew it sent out, oldest first.
+   * Shift walks it backwards. Only bots still on the surface are stops.
+   */
+  focusFamily: ({ back = false } = {}) => {
+    if (!selectedId) {
+      hud.hint('Pick a bot first — G walks its family')
+      return
+    }
+    const ring = familyRing(families, selectedId).filter((id) => isCandidate(id))
+    if (ring.length < 2) {
+      hud.hint('No family on the map for this thread')
+      return
+    }
+    const step = back ? -1 : 1
+    const at = ring.indexOf(selectedId)
+    select(ring[(at + step + ring.length) % ring.length], { fly: true })
+  },
+
+  /** What the card says about a thread's family: who started it, and who it started. */
+  familyFor: (id) => {
+    const card = (childId) => {
+      const t = colony.threads.get(childId)
+      return t ? { id: childId, title: t.title, status: statusFor(t, Date.now()) } : null
+    }
+    const managerId = families.managerOf.get(id)
+    const crew = (families.crewOf.get(id) || []).map(card).filter(Boolean)
+    const statuses = new Map(crew.map((c) => [c.id, c.status]))
+    return {
+      manager: managerId ? card(managerId) : null,
+      crew,
+      summary: crewSummary(families, id, (childId) => statuses.get(childId)),
+    }
+  },
 
   /**
    * A new thread in this repo. The desktop app opens an empty session with the folder as
@@ -662,6 +700,8 @@ function syncProject() {
       worktree: thread.worktree,
       lastActivityAt: thread.lastActivityAt,
       status: statusFor(thread, now),
+      crew: families.crewOf.get(thread.id)?.length ?? 0,
+      depth: 0,
     }))
     // Whoever wants something first, then most recently touched — the same order of
     // importance the badges use above their heads.
@@ -674,13 +714,34 @@ function syncProject() {
     name: plot.name,
     accent: plot.accent,
     path: pathForProject(plot.name),
-    threads: list,
+    threads: nestCrew(list),
     archived: archivedInProject(threads, state, plot.name),
     selectedId,
   })
   // The legend is the same selection seen from the bottom of the screen: keep it in step
   // here rather than only on the next poll.
   hud.setLegend(legendProjects, selectedProject, hidden, folded, offMap)
+}
+
+/**
+ * Crew listed under the manager that sent them out, when both are in this repo, keeping the
+ * urgency order inside each level. A manager in another repo leaves its crew at the top level
+ * here — the card still names it.
+ */
+function nestCrew(rows) {
+  const here = new Set(rows.map((r) => r.id))
+  const placed = new Set()
+  const out = []
+  const place = (row, depth) => {
+    if (placed.has(row.id)) return
+    placed.add(row.id)
+    out.push(depth ? { ...row, depth } : row)
+    for (const child of rows) if (families.managerOf.get(child.id) === row.id) place(child, depth + 1)
+  }
+  for (const row of rows) if (!here.has(families.managerOf.get(row.id))) place(row, 0)
+  // Anything a loop in the records kept from having a top still gets a row.
+  for (const row of rows) place(row, 0)
+  return out
 }
 
 // ── pointer ───────────────────────────────────────────────────────────────────────────
@@ -1082,6 +1143,10 @@ window.addEventListener('keydown', (e) => {
     case 'K':
       actions.cycleProject()
       break
+    case 'g':
+    case 'G':
+      actions.focusFamily({ back: e.shiftKey })
+      break
     case 'b':
     case 'B':
       actions.focusBusiest({ outside: e.shiftKey })
@@ -1216,6 +1281,8 @@ function applyThreads(list) {
   restoring.clear()
 
   const stats = colony.setThreads(list, archivedSet, hiddenSet, known)
+  // After the colony has decided who is on the map: a family only counts between bots on it.
+  families = buildFamilies([...colony.threads.values()])
   hud.setStats(stats)
   chimeForNewWaiting(list, archivedSet, hiddenSet)
 
