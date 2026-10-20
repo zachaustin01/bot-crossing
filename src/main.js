@@ -1281,8 +1281,8 @@ function applyThreads(list) {
   restoring.clear()
 
   const stats = colony.setThreads(list, archivedSet, hiddenSet, known)
-  // After the colony has decided who is on the map: a family only counts between bots on it.
-  families = buildFamilies([...colony.threads.values()])
+  // The colony built it from the threads on the map, which is the only place a family counts.
+  families = colony.families
   hud.setStats(stats)
   chimeForNewWaiting(list, archivedSet, hiddenSet)
 
