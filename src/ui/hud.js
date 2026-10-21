@@ -281,6 +281,11 @@ export class Hud {
       this._slider('Field of view', 'fov', 20, 60, 1, (v) => `${v}°`),
       this._toggle('Project labels', 'showLabels'),
       this._toggle('Harness brand marks', 'harnessMarks', 'The thread card paints the harness brand mark instead of the blinking face. The mark keeps a status-coloured ring, so this is taste rather than signal.'),
+      this._toggle(
+        'Hide crew alerts',
+        'hideCrewAlerts',
+        'No badges over bots another session started. Whatever they need you for shows over their manager instead.'
+      ),
       this._toggle('Reduced motion', 'reducedMotion', 'Calms the bobbing and the camera easing.'),
       this._toggle('Show FPS', 'showFps'),
       this._toggle('MCP switchboard', 'mcpSwitchboard', 'The relay tower that beams a plot — and glows its border — when a thread calls an MCP tool.'),

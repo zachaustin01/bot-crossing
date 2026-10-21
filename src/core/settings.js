@@ -155,6 +155,11 @@ export const DEFAULTS = {
    * one click and a folded repo returns to the same ground the moment a thread wakes up.
    */
   hideDormant: true,
+  /**
+   * Quiet the badges over crew — sessions another session started — and show what they need
+   * you for over their manager instead. Off by default: it only helps once you run managers.
+   */
+  hideCrewAlerts: false,
   /** The relay tower that beams a plot when a thread calls an MCP tool, and its border glow. */
   mcpSwitchboard: true,
   /** The tank of goo standing for this month's estimated spend against `monthlyBudget`. */
