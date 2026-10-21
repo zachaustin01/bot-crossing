@@ -40,6 +40,7 @@ import { liveThreadsForColony } from './hidden-projects.js'
 import {
   buildFamilies,
   buildingKindFor,
+  alertStatus,
   crewAlerts,
   crewFlags,
   crewSummary,
@@ -1253,6 +1254,12 @@ export class Colony {
   _isActive(id) {
     const thread = this.threads.get(id)
     return Boolean(thread && (thread.running || thread.unread || thread.hasError))
+  }
+
+  /** The status the jump keys go by: the bot's own, unless crew alerts are hidden — see `alertStatus`. */
+  alertStatusOf(agent) {
+    if (!this.settings.get('hideCrewAlerts')) return agent.status
+    return alertStatus(this.families, this.crewAlerts, agent.id, agent.status)
   }
 
   _badgeFor(agent) {

@@ -579,7 +579,7 @@ let lastPhrase = 0
 function jumpCandidates() {
   return colony.astronauts.agents.filter(onTheMap).map((a) => ({
     id: a.id,
-    status: a.status,
+    status: colony.alertStatusOf(a),
     project: a.thread?.project,
     lastActivityAt: a.thread?.lastActivityAt || 0,
   }))
@@ -596,7 +596,7 @@ function projectOrder() {
 function isCandidate(id, qualifies) {
   const agent = colony.agentFor(id)
   if (!agent || !onTheMap(agent)) return false
-  return !qualifies || qualifies({ id, status: agent.status, project: agent.thread?.project })
+  return !qualifies || qualifies({ id, status: colony.alertStatusOf(agent), project: agent.thread?.project })
 }
 
 /** Why a scoped jump found nobody — and, when the other side has someone, which key reaches them. */
